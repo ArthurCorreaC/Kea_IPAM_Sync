@@ -1,9 +1,12 @@
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# kea_ipam_sync.py — Patch 3
+# kea_ipam_sync.py — Patch 4
+# - Valida a estrutura da tabela `hosts` (SHOW COLUMNS) antes de alterar dados
 # - De-duplica por MAC antes de gravar (último prevalece no ciclo)
 # - Upsert 3 etapas: UPDATE por MAC -> UPDATE por (subnet_id+IP) trocando MAC -> INSERT ... ON DUPLICATE KEY UPDATE
+# - Remove automaticamente do KEA o que não está mais no phpIPAM (flag --skip-delete para preservar)
+# - Ignora endereços marcados como dinâmicos no phpIPAM (type=0/dhcp)
 # - Reload opcional do Kea Control Agent (apenas se RELOAD_AFTER_DB=true e KEA_URL setado)
 # - Logs claros: OK / WARN / ERRO / DEBUG
 # - Compatível com phpIPAM API (endereços por sub-rede), tolerante a variações de campos custom
@@ -15,7 +18,7 @@ import json
 import time
 import argparse
 import ipaddress
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 try:
     import requests
@@ -161,6 +164,14 @@ def build_items_from_ipam(raw_list: List[Dict[str, Any]]) -> List[Dict[str, Any]
             _warn(f"Item sem IP válido: {row}")
             continue
 
+        # Tipo do endereço: ignora registros claramente dinâmicos
+        tipo_val = pick_first(row, ["type", "address_type", "state"])
+        if tipo_val is not None:
+            tipo_str = str(tipo_val).strip().lower()
+            if tipo_str in {"0", "dynamic", "dhcp"}:
+                _debug(f"Ignorado {ip_s}: tipo '{tipo_str}' não é estático")
+                continue
+
         # MAC
         mac = pick_first(row, ["mac", "mac_address", "mac_addr", "hwaddr", "hw_address"])
         if not mac:
@@ -168,7 +179,7 @@ def build_items_from_ipam(raw_list: List[Dict[str, Any]]) -> List[Dict[str, Any]
             continue
 
         # Hostname
-        hostname = pick_first(row, ["hostname", "hostname_fqdn", "dns_name", "name"])
+        hostname = pick_first(row, ["hostname", "hostname_fqdn", "dns_name", "name", "description"])
 
         items.append({"ip": ip_s, "mac": str(mac).lower(), "hostname": hostname})
     return items
@@ -188,6 +199,73 @@ def db_connect():
         autocommit=True, charset="utf8mb4", cursorclass=pymysql.cursors.Cursor
     )
     return conn
+
+
+REQUIRED_HOST_COLUMNS: Dict[str, Tuple[str, ...]] = {
+    "dhcp_identifier": ("varbinary",),
+    "dhcp_identifier_type": ("tinyint",),
+    "dhcp4_subnet_id": ("int",),
+    "ipv4_address": ("int",),
+    "hostname": ("varchar", "text"),
+}
+
+OPTIONAL_HOST_COLUMNS: Dict[str, Tuple[str, ...]] = {
+    "host_id": ("int",),
+    "dhcp6_subnet_id": ("int",),
+    "dhcp4_client_classes": ("varchar", "text"),
+    "dhcp6_client_classes": ("varchar", "text"),
+    "dhcp4_next_server": ("int",),
+    "dhcp4_server_hostname": ("varchar",),
+    "dhcp4_boot_file_name": ("varchar",),
+    "user_context": ("text",),
+    "auth_key": ("varchar",),
+}
+
+
+def db_validate_hosts_schema(conn) -> bool:
+    """Valida se a tabela `hosts` possui as colunas usadas pelo sincronizador."""
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute("SHOW COLUMNS FROM hosts")
+            rows = cur.fetchall()
+    except Exception as exc:
+        _err(f"Falha ao inspecionar a tabela hosts: {exc}")
+        return False
+
+    columns = {row["Field"]: row for row in rows}
+
+    missing_required = [col for col in REQUIRED_HOST_COLUMNS if col not in columns]
+    if missing_required:
+        _err(
+            "Tabela hosts não possui as colunas obrigatórias: "
+            + ", ".join(sorted(missing_required))
+        )
+        return False
+
+    for col, expected_prefixes in REQUIRED_HOST_COLUMNS.items():
+        detected_type = str(columns[col]["Type"]).lower()
+        if not any(detected_type.startswith(prefix) for prefix in expected_prefixes):
+            _warn(
+                f"Coluna '{col}' com tipo '{detected_type}' — esperado prefixo "
+                f"{', '.join(expected_prefixes)}"
+            )
+
+    for col, expected_prefixes in OPTIONAL_HOST_COLUMNS.items():
+        if col not in columns:
+            _debug(f"Coluna opcional '{col}' não encontrada na tabela hosts")
+            continue
+        detected_type = str(columns[col]["Type"]).lower()
+        if not any(detected_type.startswith(prefix) for prefix in expected_prefixes):
+            _debug(
+                f"Coluna opcional '{col}' com tipo '{detected_type}' (esperado iniciar com "
+                f"{', '.join(expected_prefixes)})"
+            )
+
+    _debug(
+        "Colunas detectadas na tabela hosts: "
+        + ", ".join(f"{row['Field']}:{row['Type']}" for row in rows)
+    )
+    return True
 
 
 def db_upsert_host(conn, mac: str, ip: str, subnet_id: int, hostname: Optional[str], dry_run: bool=False) -> Tuple[int, str]:
@@ -349,7 +427,7 @@ def parse_mapping_env(var_name: str) -> Dict[str, int]:
     return mapping
 
 
-def sync(dry_run: bool=False, gc: bool=False) -> Tuple[int, int, int]:
+def sync(dry_run: bool=False, delete_missing: bool=True) -> Tuple[int, int, int]:
     base = os.getenv("IPAM_BASE", "").strip() or os.getenv("BASE", "").strip()
     token = os.getenv("IPAM_TOKEN", "").strip() or os.getenv("TOKEN", "").strip()
     if not base or not token:
@@ -364,20 +442,32 @@ def sync(dry_run: bool=False, gc: bool=False) -> Tuple[int, int, int]:
 
     conn = db_connect()
 
-    ok = 0
-    skipped = 0
+    if not db_validate_hosts_schema(conn):
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return (0, 0, 1)
+
+    _info("Estrutura da tabela 'hosts' validada.")
+
+    updated = 0
+    removed = 0
     errors = 0
 
-    desired = {}
+    desired: Dict[Tuple[int, str], Dict[str, Optional[str]]] = {}
+    processed_subnets: Set[int] = set()
 
     for ipam_subnet, kea_subnet_id in ipam_to_kea.items():
         rc, data = ipam_get_addresses(base, token, ipam_subnet)
         if rc != 0 or data is None:
             continue
+        subnet_int = int(kea_subnet_id)
+        processed_subnets.add(subnet_int)
         items = build_items_from_ipam(data)
 
         if not items:
-            _warn(f"Sub-rede {ipam_subnet} sem itens marcados para reserva")
+            _warn(f"Sub-rede {ipam_subnet} sem IPs elegíveis (estáticos com MAC)")
             continue
 
         # De-duplicar por MAC: o último item prevalece
@@ -393,28 +483,38 @@ def sync(dry_run: bool=False, gc: bool=False) -> Tuple[int, int, int]:
             mac = it["mac"]
             hostname = it.get("hostname")
             # Mantém o "estado desejado" para possível GC
-            desired[(int(kea_subnet_id), ip)] = {"mac": mac, "hostname": hostname}
+            desired[(subnet_int, ip)] = {"mac": mac, "hostname": hostname}
 
-            rc, msg = db_upsert_host(conn, mac, ip, int(kea_subnet_id), hostname, dry_run=dry_run)
+            rc, msg = db_upsert_host(conn, mac, ip, subnet_int, hostname, dry_run=dry_run)
             if rc == 0:
-                ok += 1
-                _info(f"DB upsert {ip} ({mac}) subnet-id={kea_subnet_id} :: {msg}")
+                updated += 1
+                action = "DRY-RUN" if dry_run else ""
+                prefix = f"{action} " if action else ""
+                _info(f"{prefix}DB upsert {ip} ({mac}) subnet-id={kea_subnet_id} :: {msg}")
             else:
                 errors += 1
                 _err(f"DB {ip}: {msg}")
 
-    # Garbage collect (opcional): remove o que existe no KEA mas não está no "desired"
-    if gc and not dry_run:
-        managed_ids = list({int(v) for v in ipam_to_kea.values()})
+    # Remove do KEA o que não está mais presente no IPAM (somente para sub-redes processadas com sucesso)
+    if delete_missing and processed_subnets:
+        managed_ids = sorted(processed_subnets)
         current = db_list_hosts_by_subnets(conn, managed_ids)
         for key, row in current.items():
             if key not in desired:
                 subnet_id, ip = key
+                if dry_run:
+                    removed += 1
+                    _info(f"DRY-RUN remover {ip} subnet-id={subnet_id}")
+                    continue
                 rc, msg = db_delete_host(conn, subnet_id, ip, dry_run=False)
                 if rc == 0:
-                    _info(f"GC remove {ip} subnet-id={subnet_id} :: {msg}")
+                    removed += 1
+                    _info(f"Removido {ip} subnet-id={subnet_id} :: {msg}")
                 else:
-                    _warn(f"GC erro ao remover {ip} subnet-id={subnet_id} :: {msg}")
+                    errors += 1
+                    _warn(f"Erro ao remover {ip} subnet-id={subnet_id} :: {msg}")
+    elif delete_missing and not processed_subnets:
+        _warn("Nenhuma sub-rede foi processada com sucesso; remoções não realizadas.")
 
     try:
         conn.close()
@@ -422,27 +522,47 @@ def sync(dry_run: bool=False, gc: bool=False) -> Tuple[int, int, int]:
         pass
 
     # Reload opcional (best-effort)
-    if not dry_run:
+    if not dry_run and (updated > 0 or removed > 0):
         kea_reload_if_enabled()
+    elif not dry_run:
+        _debug("PULANDO reload: nada mudou")
 
-    return (ok, skipped, errors)
+    return (updated, removed, errors)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sincroniza reservas do phpIPAM -> KEA MySQL (Patch 3)")
+    parser = argparse.ArgumentParser(description="Sincroniza reservas do phpIPAM -> KEA MySQL (Patch 4)")
     parser.add_argument("--dry-run", action="store_true", help="Não grava no banco; apenas loga operações")
-    parser.add_argument("--gc", action="store_true", help="Remove do KEA entradas que não estão mais no IPAM (sub-redes gerenciadas)")
+    parser.add_argument(
+        "--skip-delete",
+        dest="skip_delete",
+        action="store_true",
+        help="Não remove entradas do KEA que não estão mais no IPAM",
+    )
+    parser.add_argument(
+        "--no-delete",
+        dest="skip_delete",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--gc", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--env", default=".env", help="Caminho do arquivo .env (padrão: .env)")
     args = parser.parse_args()
+
+    if getattr(args, "gc", False):
+        _warn("Flag --gc mantida por compatibilidade: a remoção agora é padrão.")
 
     load_env(args.env)
 
     start = time.time()
-    ok, skipped, errors = sync(dry_run=args.dry_run, gc=args.gc)
+    updated, removed, errors = sync(
+        dry_run=args.dry_run,
+        delete_missing=not getattr(args, "skip_delete", False),
+    )
     elapsed = time.time() - start
 
     print()
-    print(f"Resumo: ok={ok}, pulados={skipped}, erros={errors}  ({elapsed:.2f}s)")
+    print(f"Resumo: atualizados={updated}, removidos={removed}, erros={errors}  ({elapsed:.2f}s)")
 
 
 if __name__ == "__main__":
