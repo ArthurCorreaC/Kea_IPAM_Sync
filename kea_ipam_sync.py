@@ -17,6 +17,8 @@ import sys
 import json
 import time
 import argparse
+import logging
+from datetime import datetime
 import ipaddress
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -36,18 +38,140 @@ except Exception as e:
 # ---------------------------
 # Logging helpers
 # ---------------------------
+LOG_NAME = "kea_ipam_sync"
+LOG_DIR_ENV_VAR = "KEA_IPAM_SYNC_LOG_DIR"
+LOG_RETENTION_ENV_VAR = "KEA_IPAM_SYNC_LOG_RETENTION_DAYS"
+DEFAULT_LOG_DIR = "logs"
+DEFAULT_LOG_RETENTION_DAYS = 5
+
+_LOGGER = logging.getLogger(LOG_NAME)
+_LOGGER.setLevel(logging.DEBUG)
+_LOGGER.propagate = False
+_LOGGER_INITIALIZED = False
+_CURRENT_LOG_DIR: Optional[str] = None
+_CURRENT_RETENTION_DAYS = DEFAULT_LOG_RETENTION_DAYS
+
+
+def _cleanup_old_logs(log_dir: str, keep_days: int) -> None:
+    if keep_days <= 0 or not log_dir:
+        return
+    cutoff = time.time() - (keep_days * 86400)
+    try:
+        entries = os.listdir(log_dir)
+    except OSError:
+        return
+    for name in entries:
+        if not name.startswith("kea_ipam_sync_") or not name.endswith(".log"):
+            continue
+        path = os.path.join(log_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def setup_logging(force: bool = False) -> None:
+    global _LOGGER_INITIALIZED, _CURRENT_LOG_DIR, _CURRENT_RETENTION_DAYS
+
+    log_dir = os.getenv(LOG_DIR_ENV_VAR, DEFAULT_LOG_DIR).strip() or DEFAULT_LOG_DIR
+    retention_raw = os.getenv(LOG_RETENTION_ENV_VAR, "").strip()
+    try:
+        retention_days = int(retention_raw) if retention_raw else DEFAULT_LOG_RETENTION_DAYS
+    except ValueError:
+        retention_days = DEFAULT_LOG_RETENTION_DAYS
+    if retention_days < 0:
+        retention_days = DEFAULT_LOG_RETENTION_DAYS
+
+    if _LOGGER_INITIALIZED and not force:
+        return
+    if (
+        _LOGGER_INITIALIZED
+        and force
+        and log_dir == (_CURRENT_LOG_DIR or "")
+        and retention_days == _CURRENT_RETENTION_DAYS
+    ):
+        return
+
+    prepared_log_dir = log_dir
+    if prepared_log_dir:
+        try:
+            os.makedirs(prepared_log_dir, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"[WARN] Não foi possível criar diretório de logs '{prepared_log_dir}': {exc}",
+                file=sys.stderr,
+            )
+            prepared_log_dir = ""
+
+    if prepared_log_dir:
+        _cleanup_old_logs(prepared_log_dir, retention_days)
+
+    for handler in list(_LOGGER.handlers):
+        _LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    file_handler: Optional[logging.Handler] = None
+    if prepared_log_dir:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(prepared_log_dir, f"kea_ipam_sync_{timestamp}.log")
+        try:
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        except OSError as exc:
+            print(
+                f"[WARN] Não foi possível criar arquivo de log '{log_file}': {exc}",
+                file=sys.stderr,
+            )
+            file_handler = None
+
+    if file_handler:
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+        )
+        _LOGGER.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler(stream=sys.stdout)
+    stream_handler.setLevel(logging.DEBUG)
+    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    _LOGGER.addHandler(stream_handler)
+
+    _LOGGER_INITIALIZED = True
+    _CURRENT_LOG_DIR = prepared_log_dir
+    _CURRENT_RETENTION_DAYS = retention_days
+
+
+def _ensure_logger() -> logging.Logger:
+    if not _LOGGER_INITIALIZED:
+        setup_logging()
+    return _LOGGER
+
+
+def _log(level: int, message: str) -> None:
+    logger = _ensure_logger()
+    logger.log(level, message)
+
+
 def _debug(msg: str) -> None:
     if os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "on"):
-        print(f"[DEBUG] {msg}")
+        _log(logging.DEBUG, f"[DEBUG] {msg}")
+
 
 def _info(msg: str) -> None:
-    print(f"OK   {msg}")
+    _log(logging.INFO, f"OK   {msg}")
+
 
 def _warn(msg: str) -> None:
-    print(f"[WARN] {msg}")
+    _log(logging.WARNING, f"[WARN] {msg}")
+
 
 def _err(msg: str) -> None:
-    print(f"ERRO {msg}")
+    _log(logging.ERROR, f"ERRO {msg}")
 
 
 # ---------------------------
@@ -728,6 +852,7 @@ def main():
         _warn("Flag --gc mantida por compatibilidade: a remoção agora é padrão.")
 
     load_env(args.env)
+    setup_logging(force=True)
 
     start = time.time()
     updated, removed, errors = sync(
@@ -737,7 +862,10 @@ def main():
     elapsed = time.time() - start
 
     print()
-    print(f"Resumo: atualizados={updated}, removidos={removed}, erros={errors}  ({elapsed:.2f}s)")
+    _log(
+        logging.INFO,
+        f"Resumo: atualizados={updated}, removidos={removed}, erros={errors}  ({elapsed:.2f}s)",
+    )
 
 
 if __name__ == "__main__":
