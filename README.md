@@ -54,7 +54,16 @@ kea_ipam_sync/
 ---
 
 ## ⚙️ Configuração
-Exemplo de `.env`:
+
+### Instalação do ambiente
+```bash
+cd Kea_IPAM_Sync
+python3 -m venv venv
+source venv/bin/activate
+pip install requests PyMySQL python-dotenv
+```
+
+### Exemplo de `.env`:
 
 ```ini
 # --- MODO ---
