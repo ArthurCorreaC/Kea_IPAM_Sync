@@ -24,8 +24,9 @@ O script conecta-se ao **MySQL do Kea** e utiliza a **API do phpIPAM** para gara
 - **Mapeamento flexível de sub-redes**:
   - `SUBNET_ID_MAP_JSON={"39":188}`
   - ou `IPAM_SUBNETID_TO_ID=39:188`
-- **Compatível com phpIPAM 1.7.x** (evita endpoints `search` problemáticos por padrão).
+- **Compatível com phpIPAM 1.7.3** (evita endpoints `search` problemáticos por padrão).
 - **GC opcional (garbage collect)**: pode ser habilitado para remover reservas no Kea que não estejam mais no IPAM.
+- **Logs**: armazena logs da execução do script, preservando os últimos 5 dias de execução. 
 
 ---
 
@@ -35,7 +36,7 @@ kea_ipam_sync/
 ├── kea_ipam_sync.py      # Script principal de sincronização
 ├── .env                  # Configurações de ambiente
 ├── .env.example          # Exemplo de Configurações de ambiente
-├── requirements.txt      # Dependências (requests, PyMySQL, python-dotenv)
+├── logs/                 # Pasta de logs de execução do projeto 
 ├── README.md             # Documentação do projeto
 └── venv/                 # Arquivos de execução Python
 ```
@@ -109,15 +110,16 @@ python3 kea_ipam_sync.py             # aplica mudanças
 ```
 
 ### Execução automática (Cron)
-Adicione em `crontab -e`:
+Adicione em `crontab -e` para 5 minutos:
 ```cron
-*/5 * * * * /caminho/venv/bin/python /caminho/kea_ipam_sync/kea_ipam_sync.py >> /var/log/kea_ipam_sync.log 2>&1
+*/5 * * * * cd /caminho/Kea_IPAM_Sync && /caminho/Kea_IPAM_Sync/venv/bin/python kea_ipam_sync.py --env /caminho/Kea_IPAM_Sync/.env
 ```
 
 ---
 
 ## 📝 Notas Importantes
 - **Segurança**: evite usar `root` do MySQL. Crie um usuário dedicado só com permissões na tabela `hosts`.
+- **Desenvolvimento**: foi utilizado Ubuntu Server 24.04 como SO de hospedagem e execução do script.
 
 ---
 
