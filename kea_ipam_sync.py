@@ -51,6 +51,9 @@ _LOGGER_INITIALIZED = False
 _CURRENT_LOG_DIR: Optional[str] = None
 _CURRENT_RETENTION_DAYS = DEFAULT_LOG_RETENTION_DAYS
 
+_HOSTS_HAS_HOST_ID_COLUMN = False
+_NEXT_HOST_ID_VALUE: Optional[int] = None
+
 
 def _cleanup_old_logs(log_dir: str, keep_days: int) -> None:
     if keep_days <= 0 or not log_dir:
@@ -484,8 +487,48 @@ OPTIONAL_HOST_COLUMNS: Dict[str, Tuple[str, ...]] = {
 }
 
 
+def _peek_next_host_id(cur: pymysql.cursors.Cursor) -> Optional[int]:
+    global _NEXT_HOST_ID_VALUE
+
+    if not _HOSTS_HAS_HOST_ID_COLUMN:
+        return None
+
+    if _NEXT_HOST_ID_VALUE is None:
+        try:
+            cur.execute("SELECT COALESCE(MAX(host_id), 0) FROM hosts")
+            row = cur.fetchone()
+            max_existing = 0
+            if row:
+                value = row[0]
+                if value is not None:
+                    max_existing = int(value)
+            _NEXT_HOST_ID_VALUE = max_existing
+        except Exception as exc:
+            _warn(
+                "Não foi possível obter o próximo host_id disponível; voltando ao auto-incremento. "
+                f"Detalhes: {exc}"
+            )
+            _NEXT_HOST_ID_VALUE = None
+            return None
+
+    # Não avançamos ainda; apenas sinalizamos o próximo candidato
+    return _NEXT_HOST_ID_VALUE + 1
+
+
+def _register_inserted_host_id(candidate: Optional[int]) -> None:
+    global _NEXT_HOST_ID_VALUE
+
+    if candidate is None:
+        return
+
+    if _NEXT_HOST_ID_VALUE is None or candidate > _NEXT_HOST_ID_VALUE:
+        _NEXT_HOST_ID_VALUE = candidate
+
+
 def db_validate_hosts_schema(conn) -> bool:
     """Valida se a tabela `hosts` possui as colunas usadas pelo sincronizador."""
+    global _HOSTS_HAS_HOST_ID_COLUMN, _NEXT_HOST_ID_VALUE
+
     try:
         with conn.cursor(pymysql.cursors.DictCursor) as cur:
             cur.execute("SHOW COLUMNS FROM hosts")
@@ -522,6 +565,9 @@ def db_validate_hosts_schema(conn) -> bool:
                 f"Coluna opcional '{col}' com tipo '{detected_type}' (esperado iniciar com "
                 f"{', '.join(expected_prefixes)})"
             )
+
+    _HOSTS_HAS_HOST_ID_COLUMN = "host_id" in columns
+    _NEXT_HOST_ID_VALUE = None
 
     _debug(
         "Colunas detectadas na tabela hosts: "
@@ -564,6 +610,17 @@ def db_upsert_host(conn, mac: str, ip: str, subnet_id: int, hostname: Optional[s
             dhcp4_subnet_id = VALUES(dhcp4_subnet_id)
     """
 
+    sql_ins_ondup_with_id = """
+        INSERT INTO hosts
+            (host_id, dhcp_identifier, dhcp_identifier_type, dhcp4_subnet_id, ipv4_address, hostname)
+        VALUES
+            (%s, %s, 0, %s, INET_ATON(%s), %s)
+        ON DUPLICATE KEY UPDATE
+            ipv4_address = VALUES(ipv4_address),
+            hostname     = VALUES(hostname),
+            dhcp4_subnet_id = VALUES(dhcp4_subnet_id)
+    """
+
     if dry_run:
         _debug(f"DRY-RUN DB upsert: mac={mac}, ip={ip}, host={hostname}, subnet_id={subnet_id}")
         return (0, "dry-run")
@@ -581,7 +638,29 @@ def db_upsert_host(conn, mac: str, ip: str, subnet_id: int, hostname: Optional[s
                 return (0, "upsert ok")
 
             # 3) INSERT ... ON DUPLICATE KEY UPDATE
-            cur.execute(sql_ins_ondup, (mac_bin, subnet_id, ip, hostname))
+            manual_host_id_used = False
+            candidate_host_id: Optional[int] = None
+
+            if _HOSTS_HAS_HOST_ID_COLUMN:
+                candidate_host_id = _peek_next_host_id(cur)
+                if candidate_host_id is not None:
+                    manual_host_id_used = True
+                    cur.execute(
+                        sql_ins_ondup_with_id,
+                        (candidate_host_id, mac_bin, subnet_id, ip, hostname),
+                    )
+                else:
+                    cur.execute(sql_ins_ondup, (mac_bin, subnet_id, ip, hostname))
+            else:
+                cur.execute(sql_ins_ondup, (mac_bin, subnet_id, ip, hostname))
+
+            if manual_host_id_used:
+                if cur.rowcount == 1:
+                    _register_inserted_host_id(candidate_host_id)
+                else:
+                    _debug(
+                        "INSERT ON DUPLICATE KEY acionou update; host_id manual ignorado para o contador"
+                    )
             return (0, "upsert ok")
     except Exception as e:
         return (-1, f"erro DB: {e}")
