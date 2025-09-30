@@ -30,6 +30,7 @@ except Exception as e:
 
 try:
     import pymysql
+    from pymysql.err import InterfaceError, OperationalError
 except Exception as e:
     print("[ERRO] Dependência 'PyMySQL' não instalada. Instale com: pip install PyMySQL", file=sys.stderr)
     raise
@@ -453,17 +454,65 @@ def build_items_from_ipam(raw_list: List[Dict[str, Any]]) -> List[Dict[str, Any]
 # ---------------------------
 # Banco de dados KEA (hosts)
 # ---------------------------
-def db_connect():
+def _db_connection_kwargs() -> Dict[str, Any]:
     host = env_first("KEA_DB_HOST", "DB_HOST", "MYSQL_HOST", default="localhost")
     port = int(env_first("KEA_DB_PORT", "DB_PORT", default="3306"))
     user = env_first("KEA_DB_USER", "DB_USER", "KEA_DB_USERNAME", "DB_USERNAME", default="kea")
     pwd = env_first("KEA_DB_PASS", "KEA_DB_PASSWORD", "DB_PASSWORD", "DB_PASS", default="")
     name = env_first("KEA_DB_NAME", "DB_NAME", default="kea")
-    conn = pymysql.connect(
-        host=host, port=port, user=user, password=pwd, database=name,
-        autocommit=True, charset="utf8mb4", cursorclass=pymysql.cursors.Cursor
-    )
-    return conn
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": pwd,
+        "database": name,
+        "autocommit": True,
+        "charset": "utf8mb4",
+        "cursorclass": pymysql.cursors.Cursor,
+    }
+
+
+def db_connect():
+    return pymysql.connect(**_db_connection_kwargs())
+
+
+class DatabaseSession:
+    def __init__(self) -> None:
+        self._kwargs = _db_connection_kwargs()
+        self._conn: Optional[pymysql.connections.Connection] = None
+        self._conn = self._create_connection()
+
+    def _create_connection(self) -> pymysql.connections.Connection:
+        return pymysql.connect(**self._kwargs)
+
+    def ensure(self) -> pymysql.connections.Connection:
+        if self._conn is None:
+            self._conn = self._create_connection()
+            return self._conn
+
+        try:
+            self._conn.ping(reconnect=True)
+        except (OperationalError, InterfaceError):
+            self._conn = self._create_connection()
+        return self._conn
+
+    def replace_connection(self) -> pymysql.connections.Connection:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._conn = self._create_connection()
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            finally:
+                self._conn = None
 
 
 REQUIRED_HOST_COLUMNS: Dict[str, Tuple[str, ...]] = {
@@ -662,6 +711,8 @@ def db_upsert_host(conn, mac: str, ip: str, subnet_id: int, hostname: Optional[s
                         "INSERT ON DUPLICATE KEY acionou update; host_id manual ignorado para o contador"
                     )
             return (0, "upsert ok")
+    except (OperationalError, InterfaceError):
+        raise
     except Exception as e:
         return (-1, f"erro DB: {e}")
 
@@ -680,6 +731,8 @@ def db_delete_host(conn, subnet_id: int, ip: str, dry_run: bool=False) -> Tuple[
         with conn.cursor() as cur:
             cur.execute(sql, (subnet_id, ip))
             return (0, f"deleted {cur.rowcount}")
+    except (OperationalError, InterfaceError):
+        raise
     except Exception as e:
         return (-1, f"erro DB: {e}")
 
@@ -701,11 +754,14 @@ def db_list_hosts_by_subnets(conn, managed_subnet_ids: List[int]) -> Dict[Tuple[
            AND dhcp4_subnet_id IN ({placeholders})
     """
     rows = {}
-    with conn.cursor(pymysql.cursors.DictCursor) as cur:
-        cur.execute(sql, managed_subnet_ids)
-        for r in cur.fetchall():
-            key = (int(r["dhcp4_subnet_id"]), str(r["ip"]))
-            rows[key] = r
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql, managed_subnet_ids)
+            for r in cur.fetchall():
+                key = (int(r["dhcp4_subnet_id"]), str(r["ip"]))
+                rows[key] = r
+    except (OperationalError, InterfaceError):
+        raise
     return rows
 
 
@@ -818,13 +874,11 @@ def sync(dry_run: bool=False, delete_missing: bool=True) -> Tuple[int, int, int]
         )
         return (0, 0, 1)
 
-    conn = db_connect()
+    db = DatabaseSession()
 
+    conn = db.ensure()
     if not db_validate_hosts_schema(conn):
-        try:
-            conn.close()
-        except Exception:
-            pass
+        db.close()
         return (0, 0, 1)
 
     _info("Estrutura da tabela 'hosts' validada.")
@@ -863,20 +917,79 @@ def sync(dry_run: bool=False, delete_missing: bool=True) -> Tuple[int, int, int]
             # Mantém o "estado desejado" para possível GC
             desired[(subnet_int, ip)] = {"mac": mac, "hostname": hostname}
 
-            rc, msg = db_upsert_host(conn, mac, ip, subnet_int, hostname, dry_run=dry_run)
-            if rc == 0:
-                updated += 1
-                action = "DRY-RUN" if dry_run else ""
-                prefix = f"{action} " if action else ""
-                _info(f"{prefix}DB upsert {ip} ({mac}) subnet-id={kea_subnet_id} :: {msg}")
-            else:
-                errors += 1
-                _err(f"DB {ip}: {msg}")
+            operation_completed = False
+            last_conn_error: Optional[Exception] = None
+            for attempt in range(2):
+                conn = db.ensure()
+                try:
+                    rc, msg = db_upsert_host(conn, mac, ip, subnet_int, hostname, dry_run=dry_run)
+                except (OperationalError, InterfaceError) as exc:
+                    last_conn_error = exc
+                    _warn(
+                        "Conexão com MySQL perdida durante upsert "
+                        f"de {ip} (tentativa {attempt + 1}/2): {exc}"
+                    )
+                    conn = db.replace_connection()
+                    if not db_validate_hosts_schema(conn):
+                        db.close()
+                        errors += 1
+                        return (updated, removed, errors)
+                    continue
+
+                operation_completed = True
+                if rc == 0:
+                    updated += 1
+                    action = "DRY-RUN" if dry_run else ""
+                    prefix = f"{action} " if action else ""
+                    _info(f"{prefix}DB upsert {ip} ({mac}) subnet-id={kea_subnet_id} :: {msg}")
+                else:
+                    errors += 1
+                    _err(f"DB {ip}: {msg}")
+                break
+
+            if not operation_completed:
+                if last_conn_error is not None:
+                    errors += 1
+                    _err(
+                        f"DB {ip}: erro de conexão persistente após reconexão: {last_conn_error}"
+                    )
+                continue
 
     # Remove do KEA o que não está mais presente no IPAM (somente para sub-redes processadas com sucesso)
     if delete_missing and processed_subnets:
         managed_ids = sorted(processed_subnets)
-        current = db_list_hosts_by_subnets(conn, managed_ids)
+        fetch_success = False
+        current: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        last_conn_error: Optional[Exception] = None
+        for attempt in range(2):
+            conn = db.ensure()
+            try:
+                current = db_list_hosts_by_subnets(conn, managed_ids)
+            except (OperationalError, InterfaceError) as exc:
+                last_conn_error = exc
+                _warn(
+                    "Conexão com MySQL perdida durante listagem de hosts "
+                    f"(tentativa {attempt + 1}/2): {exc}"
+                )
+                conn = db.replace_connection()
+                if not db_validate_hosts_schema(conn):
+                    db.close()
+                    errors += 1
+                    return (updated, removed, errors)
+                continue
+
+            fetch_success = True
+            break
+
+        if not fetch_success:
+            if last_conn_error is not None:
+                errors += 1
+                _warn(
+                    "Não foi possível listar hosts após reconexão; "
+                    "remoções foram puladas."
+                )
+            current = {}
+
         for key, row in current.items():
             if key not in desired:
                 subnet_id, ip = key
@@ -884,20 +997,43 @@ def sync(dry_run: bool=False, delete_missing: bool=True) -> Tuple[int, int, int]
                     removed += 1
                     _info(f"DRY-RUN remover {ip} subnet-id={subnet_id}")
                     continue
-                rc, msg = db_delete_host(conn, subnet_id, ip, dry_run=False)
-                if rc == 0:
-                    removed += 1
-                    _info(f"Removido {ip} subnet-id={subnet_id} :: {msg}")
-                else:
+                delete_completed = False
+                last_delete_error: Optional[Exception] = None
+                for attempt in range(2):
+                    conn = db.ensure()
+                    try:
+                        rc, msg = db_delete_host(conn, subnet_id, ip, dry_run=False)
+                    except (OperationalError, InterfaceError) as exc:
+                        last_delete_error = exc
+                        _warn(
+                            "Conexão com MySQL perdida durante remoção "
+                            f"de {ip} (tentativa {attempt + 1}/2): {exc}"
+                        )
+                        conn = db.replace_connection()
+                        if not db_validate_hosts_schema(conn):
+                            db.close()
+                            errors += 1
+                            return (updated, removed, errors)
+                        continue
+
+                    delete_completed = True
+                    if rc == 0:
+                        removed += 1
+                        _info(f"Removido {ip} subnet-id={subnet_id} :: {msg}")
+                    else:
+                        errors += 1
+                        _warn(f"Erro ao remover {ip} subnet-id={subnet_id} :: {msg}")
+                    break
+
+                if not delete_completed and last_delete_error is not None:
                     errors += 1
-                    _warn(f"Erro ao remover {ip} subnet-id={subnet_id} :: {msg}")
+                    _err(
+                        f"Remoção de {ip} falhou após reconexão: {last_delete_error}"
+                    )
     elif delete_missing and not processed_subnets:
         _warn("Nenhuma sub-rede foi processada com sucesso; remoções não realizadas.")
 
-    try:
-        conn.close()
-    except Exception:
-        pass
+    db.close()
 
     # Reload opcional (best-effort)
     if not dry_run and (updated > 0 or removed > 0):
