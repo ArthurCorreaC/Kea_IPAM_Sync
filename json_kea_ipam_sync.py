@@ -208,7 +208,9 @@ def _build_ssh_base(settings: Dict[str, Any]) -> str:
 
 
 def _ssh_common_args(settings: Dict[str, Any], *, for_scp: bool) -> List[str]:
-    args: List[str] = ["-o", "BatchMode=yes"]
+    args: List[str] = []
+    if not settings.get("password"):
+        args.extend(["-o", "BatchMode=yes"])
     identity = settings.get("identity")
     if identity:
         args.extend(["-i", identity])
@@ -262,21 +264,47 @@ def _load_ssh_settings() -> Optional[Dict[str, Any]]:
     extra = env_first("PF_SSH_EXTRA_ARGS", "PFSENSE_SSH_EXTRA_ARGS")
     if extra:
         settings["extra_args"] = _split_extra_args(extra)
+    password = env_first(
+        "PF_SSH_PASSWORD",
+        "PFSENSE_SSH_PASSWORD",
+        "PF_SSH_PASS",
+        "PFSENSE_SSH_PASS",
+    )
+    if password:
+        settings["password"] = password
     return settings
+
+
+def _wrap_ssh_with_password(
+    settings: Dict[str, Any], args: List[str]
+) -> Tuple[List[str], Optional[Dict[str, str]]]:
+    password = settings.get("password")
+    if not password:
+        return args, None
+    new_args = ["sshpass", "-e", *args]
+    env = os.environ.copy()
+    env["SSHPASS"] = password
+    return new_args, env
 
 
 def _run_ssh_command(settings: Dict[str, Any], command: str) -> Tuple[int, str, str]:
     target = _build_ssh_base(settings)
     args = ["ssh", *_ssh_common_args(settings, for_scp=False), target, command]
+    args, env = _wrap_ssh_with_password(settings, args)
     try:
         proc = subprocess.run(
             args,
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except FileNotFoundError:
+        missing = args[0]
+        if missing == "sshpass":
+            _err("Comando 'sshpass' não encontrado no PATH")
+            return (127, "", "sshpass não encontrado")
         _err("Comando 'ssh' não encontrado no PATH")
         return (127, "", "ssh não encontrado")
 
@@ -286,14 +314,19 @@ def _deploy_via_scp(
 ) -> Tuple[bool, str]:
     target = f"{_build_ssh_base(settings)}:{remote_path}"
     args = ["scp", *_ssh_common_args(settings, for_scp=True), local_path, target]
+    args, env = _wrap_ssh_with_password(settings, args)
     try:
         proc = subprocess.run(
             args,
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
     except FileNotFoundError:
+        missing = args[0]
+        if missing == "sshpass":
+            return False, "Comando 'sshpass' não encontrado no PATH"
         return False, "Comando 'scp' não encontrado no PATH"
     if proc.returncode != 0:
         msg = proc.stderr.strip() or proc.stdout.strip() or "falha desconhecida"

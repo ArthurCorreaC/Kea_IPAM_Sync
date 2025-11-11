@@ -53,6 +53,7 @@ kea_ipam_sync/
 - Servidor phpIPAM com API habilitada.
 - Kea DHCP com backend **MySQL** ou **arquivo JSON** (como no pfSense).
 - Para integração remota com pfSense: utilitários `ssh/scp` disponíveis no servidor onde o script roda e acesso autorizado ao pfSense.
+- Para autenticação por senha no SSH: utilitário `sshpass` instalado no servidor que executa o script.
 
 ---
 
@@ -71,7 +72,7 @@ pip install PyMySQL
 ### Exemplo de `.env`:
 
 ```ini
-# --- phpIPAM ---
+# --- phpIPAM (obrigatório) ---
 PHPIPAM_BASE_URL=https://ipam.seu.local/
 PHPIPAM_APP_ID=kea-sync
 # Se tiver token estático:
@@ -81,6 +82,7 @@ PHPIPAM_TOKEN=
 # PHPIPAM_PASSWORD=apipass
 PHPIPAM_VERIFY_TLS=false
 
+# --- Campo customizado usado para marcar reservas ---
 CUSTOM_FIELD_NAME=custom_kea_reserve
 CUSTOM_FIELD_TRUE_VALUES=1,true,yes,sim,on
 
@@ -96,13 +98,15 @@ KEA_JSON_OUTPUT_PATH=/usr/local/etc/kea/kea-dhcp4.conf
 # Opcional: usar um template estático como base
 # KEA_JSON_TEMPLATE_PATH=/usr/local/etc/kea/kea-dhcp4.template
 
-# --- pfSense remoto via SSH ---
+# --- Deploy remoto pfSense via SSH ---
 PF_SSH_HOST=pfsense.exemplo.local
 PF_SSH_USER=admin
+PF_SSH_PASSWORD=
 # PF_SSH_PORT=22
 # PF_SSH_KEY=/caminho/para/id_rsa
+# PF_SSH_KNOWN_HOSTS=/caminho/para/known_hosts
 PF_SSH_REMOTE_PATH=/usr/local/etc/kea/kea-dhcp4.conf
-# PF_SSH_RELOAD_COMMAND=keactrl reload -s dhcp4
+# PF_SSH_RELOAD_COMMAND=sudo keactrl reload -s dhcp4
 # PF_SSH_STRICT_HOST_KEY_CHECKING=true
 # PF_SSH_EXTRA_ARGS=-o ProxyCommand="ssh jumphost -W %h:%p"
 RELOAD_AFTER_DB=true
@@ -144,6 +148,7 @@ Ao definir `PF_SSH_HOST`, o `json_kea_ipam_sync.py` grava o arquivo atualizado l
 O caminho remoto padrão será o mesmo do `KEA_JSON_OUTPUT_PATH`, mas pode ser sobreposto por `PF_SSH_REMOTE_PATH`.
 Com `RELOAD_AFTER_DB=true`, o script também executa o comando configurado em `PF_SSH_RELOAD_COMMAND` (padrão `sudo keactrl reload -s dhcp4`) via SSH para aplicar as mudanças sem interromper o serviço.
 Se quiser manter o reload via Control Agent HTTP, basta deixar `PF_SSH_HOST` vazio e configurar `KEA_URL`/`KEA_USER`/`KEA_PASSWORD` normalmente.
+Quando `PF_SSH_PASSWORD` estiver definido, é necessário ter o utilitário `sshpass` instalado para autenticação não interativa por senha.
 
 ---
 
