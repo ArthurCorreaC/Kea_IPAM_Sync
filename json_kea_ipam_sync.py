@@ -8,6 +8,8 @@ import json
 import time
 import argparse
 import logging
+import shlex
+import subprocess
 from datetime import datetime
 import ipaddress
 from typing import Any, Dict, List, Optional, Tuple, Set
@@ -188,6 +190,157 @@ DEFAULT_CUSTOM_FIELDS: Tuple[str, ...] = (
     "custom_reserva_kea",
     "reserve_kea",
 )
+
+
+def _split_extra_args(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    try:
+        return shlex.split(raw)
+    except ValueError:
+        return [part for part in raw.split() if part]
+
+
+def _build_ssh_base(settings: Dict[str, Any]) -> str:
+    user = settings.get("user")
+    host = settings["host"]
+    return f"{user}@{host}" if user else host
+
+
+def _ssh_common_args(settings: Dict[str, Any], *, for_scp: bool) -> List[str]:
+    args: List[str] = ["-o", "BatchMode=yes"]
+    identity = settings.get("identity")
+    if identity:
+        args.extend(["-i", identity])
+    port = settings.get("port")
+    if port:
+        args.extend(["-P" if for_scp else "-p", str(port)])
+    known_hosts = settings.get("known_hosts")
+    strict = settings.get("strict", True)
+    if known_hosts:
+        args.extend(["-o", f"UserKnownHostsFile={known_hosts}"])
+    elif not strict:
+        args.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+            ]
+        )
+    extra_args = settings.get("extra_args") or []
+    args.extend(extra_args)
+    return args
+
+
+def _load_ssh_settings() -> Optional[Dict[str, Any]]:
+    host = env_first("PF_SSH_HOST", "PFSENSE_HOST", "PFSENSE_SSH_HOST")
+    if not host:
+        return None
+    host = host.strip()
+    if not host:
+        return None
+    settings: Dict[str, Any] = {"host": host}
+    user = env_first("PF_SSH_USER", "PFSENSE_USER", "PFSENSE_SSH_USER")
+    if user:
+        settings["user"] = user.strip()
+    port = env_first("PF_SSH_PORT", "PFSENSE_SSH_PORT")
+    if port:
+        try:
+            settings["port"] = int(port)
+        except (TypeError, ValueError):
+            _warn(f"PF_SSH_PORT inválida: {port}")
+    identity = env_first("PF_SSH_KEY", "PF_SSH_IDENTITY", "PFSENSE_SSH_KEY")
+    if identity:
+        settings["identity"] = identity.strip()
+    known_hosts = env_first("PF_SSH_KNOWN_HOSTS", "PFSENSE_KNOWN_HOSTS")
+    if known_hosts:
+        settings["known_hosts"] = known_hosts.strip()
+    strict = env_first("PF_SSH_STRICT_HOST_KEY_CHECKING", "PFSENSE_STRICT_HOST_KEY_CHECKING")
+    if strict is not None:
+        settings["strict"] = parse_bool(strict, default=True)
+    extra = env_first("PF_SSH_EXTRA_ARGS", "PFSENSE_SSH_EXTRA_ARGS")
+    if extra:
+        settings["extra_args"] = _split_extra_args(extra)
+    return settings
+
+
+def _run_ssh_command(settings: Dict[str, Any], command: str) -> Tuple[int, str, str]:
+    target = _build_ssh_base(settings)
+    args = ["ssh", *_ssh_common_args(settings, for_scp=False), target, command]
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except FileNotFoundError:
+        _err("Comando 'ssh' não encontrado no PATH")
+        return (127, "", "ssh não encontrado")
+
+
+def _deploy_via_scp(
+    settings: Dict[str, Any], local_path: str, remote_path: str
+) -> Tuple[bool, str]:
+    target = f"{_build_ssh_base(settings)}:{remote_path}"
+    args = ["scp", *_ssh_common_args(settings, for_scp=True), local_path, target]
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False, "Comando 'scp' não encontrado no PATH"
+    if proc.returncode != 0:
+        msg = proc.stderr.strip() or proc.stdout.strip() or "falha desconhecida"
+        return False, msg
+    return True, ""
+
+
+def _ensure_remote_directory(settings: Dict[str, Any], remote_path: str) -> bool:
+    directory = os.path.dirname(remote_path)
+    if not directory or directory in (".", "/"):
+        return True
+    cmd = f"mkdir -p {shlex.quote(directory)}"
+    rc, _, stderr = _run_ssh_command(settings, cmd)
+    if rc != 0:
+        msg = stderr or f"mkdir -p retornou código {rc}"
+        _warn(f"Falha ao criar diretório remoto {directory}: {msg}")
+        return False
+    return True
+
+
+def deploy_config_to_pfsense(local_path: str, default_remote_path: str) -> Tuple[bool, bool]:
+    settings = _load_ssh_settings()
+    if not settings:
+        return (False, True)
+    remote_path = env_first(
+        "PF_SSH_REMOTE_PATH",
+        "PFSENSE_REMOTE_CONFIG_PATH",
+        "KEA_REMOTE_CONFIG_PATH",
+    )
+    if remote_path:
+        remote_path = remote_path.strip()
+    if not remote_path:
+        remote_path = default_remote_path
+    if not remote_path:
+        _err("PF_SSH_REMOTE_PATH não configurado e caminho local vazio")
+        return (True, False)
+
+    if not _ensure_remote_directory(settings, remote_path):
+        return (True, False)
+
+    ok, message = _deploy_via_scp(settings, local_path, remote_path)
+    if not ok:
+        _err(f"Falha ao enviar arquivo para pfSense: {message}")
+        return (True, False)
+
+    _info(f"Arquivo enviado para pfSense: {remote_path}")
+    return (True, True)
 
 
 def env_first(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -486,6 +639,27 @@ def kea_reload_if_enabled() -> None:
     if os.getenv("RELOAD_AFTER_DB", "false").lower() not in ("1", "true", "yes", "on"):
         _debug("PULANDO reload: RELOAD_AFTER_DB=false")
         return
+    ssh_settings = _load_ssh_settings()
+    if ssh_settings:
+        reload_cmd = env_first("PF_SSH_RELOAD_COMMAND", "PFSENSE_RELOAD_COMMAND")
+        if reload_cmd:
+            reload_cmd = reload_cmd.strip()
+        if not reload_cmd:
+            reload_cmd = "sudo keactrl reload -s dhcp4"
+        if reload_cmd:
+            rc, stdout, stderr = _run_ssh_command(ssh_settings, reload_cmd)
+            if rc == 0:
+                message = stdout or stderr
+                if message:
+                    _debug(f"SSH reload output: {message}")
+                _info("reload solicitado ao pfSense via SSH")
+                return
+            else:
+                msg = stderr or stdout or f"código {rc}"
+                _warn(f"reload via SSH falhou (best-effort): {msg}")
+        else:
+            _debug("PULANDO reload via SSH: comando vazio")
+
     base = os.getenv("KEA_URL", "").strip()
     if not base:
         _debug("PULANDO reload: KEA_URL vazio")
@@ -769,8 +943,15 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
         _err(f"Falha ao escrever {output_path}: {exc}")
         return (total_reservations, subnets_modified, errors)
 
+    remote_attempted, remote_ok = deploy_config_to_pfsense(output_path, output_path)
+    if remote_attempted and not remote_ok:
+        errors += 1
+
     if total_reservations > 0 or subnets_modified > 0:
-        kea_reload_if_enabled()
+        if not remote_attempted or remote_ok:
+            kea_reload_if_enabled()
+        else:
+            _warn("PULANDO reload: envio via SSH falhou")
     else:
         _debug("PULANDO reload: nada mudou")
 

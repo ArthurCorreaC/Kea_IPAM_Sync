@@ -18,7 +18,7 @@ Agora o projeto oferece dois modos de sincronização:
 
 ## 🛠️ Funcionalidades
 - **De-duplicação por identificador**: client-id tem prioridade; o último registro válido prevalece.
-- **Reload opcional**: suporta envio de `config-reload` ao **Control Agent** após alterações (ativado via `RELOAD_AFTER_DB=true`).
+- **Reload opcional**: após alterar reservas, pode acionar o reload via **Control Agent HTTP** ou executar um comando remoto no pfSense por **SSH** (`RELOAD_AFTER_DB=true`).
 - **Mapeamento flexível de sub-redes**:
   - `SUBNET_ID_MAP_JSON={"39":188}`
   - ou `IPAM_SUBNETID_TO_ID=39:188`
@@ -52,6 +52,7 @@ kea_ipam_sync/
 - Para o modo MySQL: adicionar `PyMySQL`.
 - Servidor phpIPAM com API habilitada.
 - Kea DHCP com backend **MySQL** ou **arquivo JSON** (como no pfSense).
+- Para integração remota com pfSense: utilitários `ssh/scp` disponíveis no servidor onde o script roda e acesso autorizado ao pfSense.
 
 ---
 
@@ -95,6 +96,17 @@ KEA_JSON_OUTPUT_PATH=/usr/local/etc/kea/kea-dhcp4.conf
 # Opcional: usar um template estático como base
 # KEA_JSON_TEMPLATE_PATH=/usr/local/etc/kea/kea-dhcp4.template
 
+# --- pfSense remoto via SSH ---
+PF_SSH_HOST=pfsense.exemplo.local
+PF_SSH_USER=admin
+# PF_SSH_PORT=22
+# PF_SSH_KEY=/caminho/para/id_rsa
+PF_SSH_REMOTE_PATH=/usr/local/etc/kea/kea-dhcp4.conf
+# PF_SSH_RELOAD_COMMAND=keactrl reload -s dhcp4
+# PF_SSH_STRICT_HOST_KEY_CHECKING=true
+# PF_SSH_EXTRA_ARGS=-o ProxyCommand="ssh jumphost -W %h:%p"
+RELOAD_AFTER_DB=true
+
 # --- Mapeamentos de subnet-id ---
 SUBNET_ID_MAP_JSON={"39":188}
 
@@ -126,6 +138,12 @@ Adicione em `crontab -e` para 5 minutos (ajuste o script conforme o modo desejad
 # ou
 */5 * * * * cd /caminho/Kea_IPAM_Sync && /caminho/Kea_IPAM_Sync/venv/bin/python json_kea_ipam_sync.py --env /caminho/Kea_IPAM_Sync/.env
 ```
+
+### Execução remota para pfSense
+Ao definir `PF_SSH_HOST`, o `json_kea_ipam_sync.py` grava o arquivo atualizado localmente e, em seguida, envia o conteúdo para o pfSense usando `scp`.
+O caminho remoto padrão será o mesmo do `KEA_JSON_OUTPUT_PATH`, mas pode ser sobreposto por `PF_SSH_REMOTE_PATH`.
+Com `RELOAD_AFTER_DB=true`, o script também executa o comando configurado em `PF_SSH_RELOAD_COMMAND` (padrão `sudo keactrl reload -s dhcp4`) via SSH para aplicar as mudanças sem interromper o serviço.
+Se quiser manter o reload via Control Agent HTTP, basta deixar `PF_SSH_HOST` vazio e configurar `KEA_URL`/`KEA_USER`/`KEA_PASSWORD` normalmente.
 
 ---
 
