@@ -1,7 +1,7 @@
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# kea_ipam_sync.py — Patch 4
+# mysql_kea_ipam_sync.py — Patch 4
 # - Valida a estrutura da tabela `hosts` (SHOW COLUMNS) antes de alterar dados
 # - De-duplica por MAC antes de gravar (último prevalece no ciclo)
 # - Upsert 3 etapas: UPDATE por MAC -> UPDATE por (subnet_id+IP) trocando MAC -> INSERT ... ON DUPLICATE KEY UPDATE
@@ -39,7 +39,7 @@ except Exception as e:
 # ---------------------------
 # Logging helpers
 # ---------------------------
-LOG_NAME = "kea_ipam_sync"
+LOG_NAME = "mysql_kea_ipam_sync"
 LOG_DIR_ENV_VAR = "KEA_IPAM_SYNC_LOG_DIR"
 LOG_RETENTION_ENV_VAR = "KEA_IPAM_SYNC_LOG_RETENTION_DAYS"
 DEFAULT_LOG_DIR = "logs"
@@ -65,7 +65,7 @@ def _cleanup_old_logs(log_dir: str, keep_days: int) -> None:
     except OSError:
         return
     for name in entries:
-        if not name.startswith("kea_ipam_sync_") or not name.endswith(".log"):
+        if not name.startswith("mysql_kea_ipam_sync_") or not name.endswith(".log"):
             continue
         path = os.path.join(log_dir, name)
         if not os.path.isfile(path):
@@ -123,7 +123,7 @@ def setup_logging(force: bool = False) -> None:
     file_handler: Optional[logging.Handler] = None
     if prepared_log_dir:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(prepared_log_dir, f"kea_ipam_sync_{timestamp}.log")
+        log_file = os.path.join(prepared_log_dir, f"mysql_kea_ipam_sync_{timestamp}.log")
         try:
             file_handler = logging.FileHandler(log_file, encoding="utf-8")
         except OSError as exc:
