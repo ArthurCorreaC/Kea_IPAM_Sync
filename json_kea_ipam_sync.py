@@ -9,6 +9,7 @@ import time
 import argparse
 import logging
 import shlex
+import shutil
 import subprocess
 from datetime import datetime
 import ipaddress
@@ -19,6 +20,11 @@ try:
 except Exception as e:  # pragma: no cover - dependência externa
     print("[ERRO] Dependência 'requests' não instalada. Instale com: pip install requests", file=sys.stderr)
     raise
+
+try:  # pragma: no cover - dependência opcional
+    import paramiko  # type: ignore
+except Exception:
+    paramiko = None  # type: ignore
 
 
 # ---------------------------
@@ -243,6 +249,7 @@ def _load_ssh_settings() -> Optional[Dict[str, Any]]:
     if not host:
         return None
     settings: Dict[str, Any] = {"host": host}
+    transport = "ssh"
     user = env_first("PF_SSH_USER", "PFSENSE_USER", "PFSENSE_SSH_USER")
     if user:
         settings["user"] = user.strip()
@@ -272,6 +279,13 @@ def _load_ssh_settings() -> Optional[Dict[str, Any]]:
     )
     if password:
         settings["password"] = password
+        if shutil.which("sshpass"):
+            transport = "sshpass"
+        elif paramiko is not None:
+            transport = "paramiko"
+        else:
+            transport = "unsupported"
+    settings["_transport"] = transport
     return settings
 
 
@@ -279,7 +293,7 @@ def _wrap_ssh_with_password(
     settings: Dict[str, Any], args: List[str]
 ) -> Tuple[List[str], Optional[Dict[str, str]]]:
     password = settings.get("password")
-    if not password:
+    if not password or settings.get("_transport") != "sshpass":
         return args, None
     new_args = ["sshpass", "-e", *args]
     env = os.environ.copy()
@@ -287,7 +301,105 @@ def _wrap_ssh_with_password(
     return new_args, env
 
 
+def _paramiko_connect(settings: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
+    if paramiko is None:
+        return None, "biblioteca paramiko não instalada"
+    client = paramiko.SSHClient()
+    strict = settings.get("strict", True)
+    known_hosts = settings.get("known_hosts")
+    try:
+        client.load_system_host_keys()
+    except Exception:
+        pass
+    if known_hosts:
+        try:
+            client.load_host_keys(known_hosts)
+        except Exception as exc:
+            client.close()
+            return None, f"falha ao carregar known_hosts '{known_hosts}': {exc}"
+    if strict:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    else:
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    connect_args: Dict[str, Any] = {
+        "hostname": settings["host"],
+        "port": settings.get("port", 22),
+        "username": settings.get("user") or None,
+        "timeout": 10,
+        "banner_timeout": 10,
+    }
+    identity = settings.get("identity")
+    if identity:
+        connect_args["key_filename"] = identity
+    password = settings.get("password")
+    if password:
+        connect_args["password"] = password
+        connect_args["allow_agent"] = False
+        connect_args["look_for_keys"] = False
+    else:
+        connect_args.setdefault("allow_agent", True)
+        connect_args.setdefault("look_for_keys", True)
+
+    try:
+        client.connect(**connect_args)
+    except Exception as exc:
+        client.close()
+        return None, str(exc)
+    return client, None
+
+
+def _paramiko_run_command(settings: Dict[str, Any], command: str) -> Tuple[int, str, str]:
+    client, error = _paramiko_connect(settings)
+    if client is None:
+        return 255, "", error or "falha ao inicializar conexão Paramiko"
+    try:
+        stdin, stdout, stderr = client.exec_command(command)
+        exit_status = stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="ignore").strip()
+        err = stderr.read().decode(errors="ignore").strip()
+        return exit_status, out, err
+    except Exception as exc:
+        return 255, "", str(exc)
+    finally:
+        client.close()
+
+
+def _paramiko_deploy(
+    settings: Dict[str, Any], local_path: str, remote_path: str
+) -> Tuple[bool, str]:
+    client, error = _paramiko_connect(settings)
+    if client is None:
+        return False, error or "falha ao inicializar conexão Paramiko"
+    try:
+        directory = os.path.dirname(remote_path)
+        if directory and directory not in (".", "/"):
+            cmd = f"mkdir -p {shlex.quote(directory)}"
+            stdin, stdout, stderr = client.exec_command(cmd)
+            exit_status = stdout.channel.recv_exit_status()
+            stdout_data = stdout.read().decode(errors="ignore").strip()
+            stderr_data = stderr.read().decode(errors="ignore").strip()
+            if exit_status != 0:
+                message = stderr_data or stdout_data or f"mkdir -p retornou código {exit_status}"
+                return False, message
+        try:
+            with client.open_sftp() as sftp:
+                sftp.put(local_path, remote_path)
+        except Exception as exc:
+            return False, str(exc)
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        client.close()
+    return True, ""
+
+
 def _run_ssh_command(settings: Dict[str, Any], command: str) -> Tuple[int, str, str]:
+    transport = settings.get("_transport", "ssh")
+    if transport == "unsupported":
+        return 127, "", "Autenticação por senha requer 'sshpass' ou biblioteca 'paramiko'"
+    if transport == "paramiko":
+        return _paramiko_run_command(settings, command)
     target = _build_ssh_base(settings)
     args = ["ssh", *_ssh_common_args(settings, for_scp=False), target, command]
     args, env = _wrap_ssh_with_password(settings, args)
@@ -312,6 +424,11 @@ def _run_ssh_command(settings: Dict[str, Any], command: str) -> Tuple[int, str, 
 def _deploy_via_scp(
     settings: Dict[str, Any], local_path: str, remote_path: str
 ) -> Tuple[bool, str]:
+    transport = settings.get("_transport", "ssh")
+    if transport == "unsupported":
+        return False, "Autenticação por senha requer 'sshpass' ou biblioteca 'paramiko'"
+    if transport == "paramiko":
+        return _paramiko_deploy(settings, local_path, remote_path)
     target = f"{_build_ssh_base(settings)}:{remote_path}"
     args = ["scp", *_ssh_common_args(settings, for_scp=True), local_path, target]
     args, env = _wrap_ssh_with_password(settings, args)
@@ -335,6 +452,13 @@ def _deploy_via_scp(
 
 
 def _ensure_remote_directory(settings: Dict[str, Any], remote_path: str) -> bool:
+    transport = settings.get("_transport", "ssh")
+    if transport == "unsupported":
+        _warn("Autenticação por senha requer 'sshpass' instalado ou 'pip install paramiko'")
+        return False
+    if transport == "paramiko":
+        # O mkdir será feito durante o deploy via Paramiko
+        return True
     directory = os.path.dirname(remote_path)
     if not directory or directory in (".", "/"):
         return True
@@ -362,6 +486,13 @@ def deploy_config_to_pfsense(local_path: str, default_remote_path: str) -> Tuple
         remote_path = default_remote_path
     if not remote_path:
         _err("PF_SSH_REMOTE_PATH não configurado e caminho local vazio")
+        return (True, False)
+
+    transport = settings.get("_transport", "ssh")
+    if transport == "unsupported":
+        _err(
+            "Autenticação por senha requer o utilitário 'sshpass' instalado ou a biblioteca Python 'paramiko' (pip install paramiko)"
+        )
         return (True, False)
 
     if not _ensure_remote_directory(settings, remote_path):
@@ -674,24 +805,29 @@ def kea_reload_if_enabled() -> None:
         return
     ssh_settings = _load_ssh_settings()
     if ssh_settings:
-        reload_cmd = env_first("PF_SSH_RELOAD_COMMAND", "PFSENSE_RELOAD_COMMAND")
-        if reload_cmd:
-            reload_cmd = reload_cmd.strip()
-        if not reload_cmd:
-            reload_cmd = "sudo keactrl reload -s dhcp4"
-        if reload_cmd:
-            rc, stdout, stderr = _run_ssh_command(ssh_settings, reload_cmd)
-            if rc == 0:
-                message = stdout or stderr
-                if message:
-                    _debug(f"SSH reload output: {message}")
-                _info("reload solicitado ao pfSense via SSH")
-                return
-            else:
-                msg = stderr or stdout or f"código {rc}"
-                _warn(f"reload via SSH falhou (best-effort): {msg}")
+        if ssh_settings.get("_transport") == "unsupported":
+            _warn(
+                "PULANDO reload via SSH: instale 'sshpass' ou 'pip install paramiko' para suportar autenticação por senha"
+            )
         else:
-            _debug("PULANDO reload via SSH: comando vazio")
+            reload_cmd = env_first("PF_SSH_RELOAD_COMMAND", "PFSENSE_RELOAD_COMMAND")
+            if reload_cmd:
+                reload_cmd = reload_cmd.strip()
+            if not reload_cmd:
+                reload_cmd = "sudo keactrl reload -s dhcp4"
+            if reload_cmd:
+                rc, stdout, stderr = _run_ssh_command(ssh_settings, reload_cmd)
+                if rc == 0:
+                    message = stdout or stderr
+                    if message:
+                        _debug(f"SSH reload output: {message}")
+                    _info("reload solicitado ao pfSense via SSH")
+                    return
+                else:
+                    msg = stderr or stdout or f"código {rc}"
+                    _warn(f"reload via SSH falhou (best-effort): {msg}")
+            else:
+                _debug("PULANDO reload via SSH: comando vazio")
 
     base = os.getenv("KEA_URL", "").strip()
     if not base:

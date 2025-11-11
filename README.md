@@ -53,7 +53,7 @@ kea_ipam_sync/
 - Servidor phpIPAM com API habilitada.
 - Kea DHCP com backend **MySQL** ou **arquivo JSON** (como no pfSense).
 - Para integração remota com pfSense: utilitários `ssh/scp` disponíveis no servidor onde o script roda e acesso autorizado ao pfSense.
-- Para autenticação por senha no SSH: utilitário `sshpass` instalado no servidor que executa o script.
+- Para autenticação por senha no SSH: utilitário `sshpass` instalado **ou** biblioteca Python `paramiko` disponível.
 
 ---
 
@@ -67,6 +67,8 @@ source venv/bin/activate
 pip install requests python-dotenv
 # Apenas para o modo MySQL:
 pip install PyMySQL
+# Para autenticação por senha sem sshpass instalado:
+# pip install paramiko
 ```
 
 ### Exemplo de `.env`:
@@ -148,7 +150,7 @@ Ao definir `PF_SSH_HOST`, o `json_kea_ipam_sync.py` grava o arquivo atualizado l
 O caminho remoto padrão será o mesmo do `KEA_JSON_OUTPUT_PATH`, mas pode ser sobreposto por `PF_SSH_REMOTE_PATH`.
 Com `RELOAD_AFTER_DB=true`, o script também executa o comando configurado em `PF_SSH_RELOAD_COMMAND` (padrão `sudo keactrl reload -s dhcp4`) via SSH para aplicar as mudanças sem interromper o serviço.
 Se quiser manter o reload via Control Agent HTTP, basta deixar `PF_SSH_HOST` vazio e configurar `KEA_URL`/`KEA_USER`/`KEA_PASSWORD` normalmente.
-Quando `PF_SSH_PASSWORD` estiver definido, é necessário ter o utilitário `sshpass` instalado para autenticação não interativa por senha.
+Quando `PF_SSH_PASSWORD` estiver definido, o script usa `sshpass` (se disponível) ou, alternativamente, a biblioteca Python `paramiko`. Instale um dos dois métodos para permitir autenticação não interativa por senha.
 
 ---
 
