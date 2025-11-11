@@ -273,10 +273,54 @@ def get_custom_true_values() -> Set[str]:
     return set(DEFAULT_TRUE_VALUES)
 
 
+HEX_DIGITS = set("0123456789abcdef")
+
+
+def _clean_hex_string(value: str) -> str:
+    return "".join(ch for ch in value if ch.lower() in HEX_DIGITS)
+
+
+def normalize_mac(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = _clean_hex_string(str(value))
+    if len(cleaned) != 12:
+        return None
+    return cleaned.lower()
+
+
+def normalize_client_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = _clean_hex_string(str(value))
+    if len(cleaned) < 2 or len(cleaned) % 2 != 0:
+        return None
+    if len(cleaned) > 64:
+        return None
+    return cleaned.lower()
+
+
+def hex_to_bytes(value: str) -> bytes:
+    return bytes.fromhex(value)
+
+
 def mac_to_bin(mac: str) -> bytes:
     # Remove separadores e converte para bytes
     s = mac.replace(":", "").replace("-", "").lower()
     return bytes.fromhex(s)
+
+
+def _group_hex_pairs(value: str) -> str:
+    return ":".join(value[i : i + 2] for i in range(0, len(value), 2))
+
+
+def format_identifier_for_log(identifier_hex: str, identifier_type: int) -> str:
+    identifier_hex = identifier_hex.lower()
+    if identifier_type == 0 and len(identifier_hex) == 12:
+        return _group_hex_pairs(identifier_hex)
+    if identifier_type == 1:
+        return f"client-id:{_group_hex_pairs(identifier_hex)}"
+    return identifier_hex
 
 
 def ip_to_str(v: Any) -> Optional[str]:
@@ -438,16 +482,48 @@ def build_items_from_ipam(raw_list: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 _debug(f"Ignorado {ip_s}: tipo '{tipo_str}' não é estático")
                 continue
 
-        # MAC
-        mac = pick_first(row, ["mac", "mac_address", "mac_addr", "hwaddr", "hw_address"])
-        if not mac:
-            _warn(f"Pulado: {ip_s} sem MAC")
-            continue
+        # Identificador: client-id tem precedência quando presente
+        identifier_type = 0
+        identifier_hex: Optional[str] = None
+
+        client_id = pick_first(
+            row,
+            [
+                "client_id",
+                "custom_client_id",
+                "clientid",
+                "custom_clientid",
+            ],
+        )
+
+        if client_id not in (None, ""):
+            normalized_client_id = normalize_client_id(client_id)
+            if not normalized_client_id:
+                _warn(f"Pulado: {ip_s} com client-id inválido ({client_id})")
+                continue
+            identifier_type = 1
+            identifier_hex = normalized_client_id
+        else:
+            mac = pick_first(row, ["mac", "mac_address", "mac_addr", "hwaddr", "hw_address"])
+            normalized_mac = normalize_mac(mac)
+            if not normalized_mac:
+                _warn(f"Pulado: {ip_s} sem MAC válido")
+                continue
+            identifier_type = 0
+            identifier_hex = normalized_mac
 
         # Hostname
         hostname = pick_first(row, ["hostname", "hostname_fqdn", "dns_name", "name", "description"])
 
-        items.append({"ip": ip_s, "mac": str(mac).lower(), "hostname": hostname})
+        items.append(
+            {
+                "ip": ip_s,
+                "identifier_hex": identifier_hex,
+                "identifier_type": identifier_type,
+                "hostname": hostname,
+                "log_identifier": format_identifier_for_log(identifier_hex, identifier_type),
+            }
+        )
     return items
 
 
@@ -625,25 +701,37 @@ def db_validate_hosts_schema(conn) -> bool:
     return True
 
 
-def db_upsert_host(conn, mac: str, ip: str, subnet_id: int, hostname: Optional[str], dry_run: bool=False) -> Tuple[int, str]:
-    mac_bin = mac_to_bin(mac)
+def db_upsert_host(
+    conn,
+    identifier_hex: str,
+    ip: str,
+    subnet_id: int,
+    hostname: Optional[str],
+    identifier_type: int,
+    dry_run: bool = False,
+) -> Tuple[int, str]:
+    try:
+        identifier_bin = hex_to_bytes(identifier_hex)
+    except ValueError as exc:
+        return (-1, f"identificador inválido: {exc}")
 
-    sql_upd_by_mac = """
+    sql_upd_by_identifier = """
         UPDATE hosts
            SET ipv4_address = INET_ATON(%s),
                hostname = %s,
-               dhcp4_subnet_id = %s
+               dhcp4_subnet_id = %s,
+               dhcp_identifier_type = %s
          WHERE dhcp_identifier = %s
-           AND dhcp_identifier_type = 0
+           AND dhcp_identifier_type = %s
     """
 
-    # Toma posse de uma linha existente pelo IP (mesma sub-rede), trocando o MAC
+    # Toma posse de uma linha existente pelo IP (mesma sub-rede), trocando o identificador
     sql_upd_by_ip = """
         UPDATE hosts
            SET dhcp_identifier = %s,
+               dhcp_identifier_type = %s,
                hostname = %s
-         WHERE dhcp_identifier_type = 0
-           AND dhcp4_subnet_id = %s
+         WHERE dhcp4_subnet_id = %s
            AND ipv4_address = INET_ATON(%s)
     """
 
@@ -652,8 +740,10 @@ def db_upsert_host(conn, mac: str, ip: str, subnet_id: int, hostname: Optional[s
         INSERT INTO hosts
             (dhcp_identifier, dhcp_identifier_type, dhcp4_subnet_id, ipv4_address, hostname)
         VALUES
-            (%s, 0, %s, INET_ATON(%s), %s)
+            (%s, %s, %s, INET_ATON(%s), %s)
         ON DUPLICATE KEY UPDATE
+            dhcp_identifier = VALUES(dhcp_identifier),
+            dhcp_identifier_type = VALUES(dhcp_identifier_type),
             ipv4_address = VALUES(ipv4_address),
             hostname     = VALUES(hostname),
             dhcp4_subnet_id = VALUES(dhcp4_subnet_id)
@@ -663,26 +753,39 @@ def db_upsert_host(conn, mac: str, ip: str, subnet_id: int, hostname: Optional[s
         INSERT INTO hosts
             (host_id, dhcp_identifier, dhcp_identifier_type, dhcp4_subnet_id, ipv4_address, hostname)
         VALUES
-            (%s, %s, 0, %s, INET_ATON(%s), %s)
+            (%s, %s, %s, %s, INET_ATON(%s), %s)
         ON DUPLICATE KEY UPDATE
+            dhcp_identifier = VALUES(dhcp_identifier),
+            dhcp_identifier_type = VALUES(dhcp_identifier_type),
             ipv4_address = VALUES(ipv4_address),
             hostname     = VALUES(hostname),
             dhcp4_subnet_id = VALUES(dhcp4_subnet_id)
     """
 
+    display_identifier = format_identifier_for_log(identifier_hex, identifier_type)
+
     if dry_run:
-        _debug(f"DRY-RUN DB upsert: mac={mac}, ip={ip}, host={hostname}, subnet_id={subnet_id}")
+        _debug(
+            "DRY-RUN DB upsert: id=%s, type=%s, ip=%s, host=%s, subnet_id=%s"
+            % (display_identifier, identifier_type, ip, hostname, subnet_id)
+        )
         return (0, "dry-run")
 
     try:
         with conn.cursor() as cur:
-            # 1) UPDATE por MAC
-            cur.execute(sql_upd_by_mac, (ip, hostname, subnet_id, mac_bin))
+            # 1) UPDATE por identificador
+            cur.execute(
+                sql_upd_by_identifier,
+                (ip, hostname, subnet_id, identifier_type, identifier_bin, identifier_type),
+            )
             if cur.rowcount > 0:
                 return (0, "upsert ok")
 
-            # 2) UPDATE por (subnet_id + IP) trocando o MAC
-            cur.execute(sql_upd_by_ip, (mac_bin, hostname, subnet_id, ip))
+            # 2) UPDATE por (subnet_id + IP) trocando o identificador
+            cur.execute(
+                sql_upd_by_ip,
+                (identifier_bin, identifier_type, hostname, subnet_id, ip),
+            )
             if cur.rowcount > 0:
                 return (0, "upsert ok")
 
@@ -696,12 +799,25 @@ def db_upsert_host(conn, mac: str, ip: str, subnet_id: int, hostname: Optional[s
                     manual_host_id_used = True
                     cur.execute(
                         sql_ins_ondup_with_id,
-                        (candidate_host_id, mac_bin, subnet_id, ip, hostname),
+                        (
+                            candidate_host_id,
+                            identifier_bin,
+                            identifier_type,
+                            subnet_id,
+                            ip,
+                            hostname,
+                        ),
                     )
                 else:
-                    cur.execute(sql_ins_ondup, (mac_bin, subnet_id, ip, hostname))
+                    cur.execute(
+                        sql_ins_ondup,
+                        (identifier_bin, identifier_type, subnet_id, ip, hostname),
+                    )
             else:
-                cur.execute(sql_ins_ondup, (mac_bin, subnet_id, ip, hostname))
+                cur.execute(
+                    sql_ins_ondup,
+                    (identifier_bin, identifier_type, subnet_id, ip, hostname),
+                )
 
             if manual_host_id_used:
                 if cur.rowcount == 1:
@@ -717,19 +833,28 @@ def db_upsert_host(conn, mac: str, ip: str, subnet_id: int, hostname: Optional[s
         return (-1, f"erro DB: {e}")
 
 
-def db_delete_host(conn, subnet_id: int, ip: str, dry_run: bool=False) -> Tuple[int, str]:
+def db_delete_host(
+    conn,
+    subnet_id: int,
+    ip: str,
+    identifier_type: int,
+    dry_run: bool = False,
+) -> Tuple[int, str]:
     sql = """
         DELETE FROM hosts
          WHERE dhcp4_subnet_id = %s
            AND ipv4_address = INET_ATON(%s)
-           AND dhcp_identifier_type = 0
+           AND dhcp_identifier_type = %s
     """
     if dry_run:
-        _debug(f"DRY-RUN DB delete: subnet_id={subnet_id}, ip={ip}")
+        _debug(
+            "DRY-RUN DB delete: subnet_id=%s, ip=%s, type=%s"
+            % (subnet_id, ip, identifier_type)
+        )
         return (0, "dry-run")
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (subnet_id, ip))
+            cur.execute(sql, (subnet_id, ip, identifier_type))
             return (0, f"deleted {cur.rowcount}")
     except (OperationalError, InterfaceError):
         raise
@@ -744,13 +869,13 @@ def db_list_hosts_by_subnets(conn, managed_subnet_ids: List[int]) -> Dict[Tuple[
     placeholders = ",".join(["%s"] * len(managed_subnet_ids))
     sql = f"""
         SELECT host_id,
-               HEX(dhcp_identifier) AS mac_hex,
+               HEX(dhcp_identifier) AS identifier_hex,
                dhcp_identifier_type,
                dhcp4_subnet_id,
                INET_NTOA(ipv4_address) AS ip,
                hostname
           FROM hosts
-         WHERE dhcp_identifier_type = 0
+         WHERE dhcp_identifier_type IN (0, 1)
            AND dhcp4_subnet_id IN ({placeholders})
     """
     rows = {}
@@ -759,6 +884,19 @@ def db_list_hosts_by_subnets(conn, managed_subnet_ids: List[int]) -> Dict[Tuple[
             cur.execute(sql, managed_subnet_ids)
             for r in cur.fetchall():
                 key = (int(r["dhcp4_subnet_id"]), str(r["ip"]))
+                identifier_hex = r.get("identifier_hex")
+                if identifier_hex is not None:
+                    try:
+                        identifier_hex = str(identifier_hex).lower()
+                    except Exception:
+                        identifier_hex = str(identifier_hex)
+                    r["identifier_hex"] = identifier_hex
+                    try:
+                        r["log_identifier"] = format_identifier_for_log(
+                            identifier_hex, int(r.get("dhcp_identifier_type", 0))
+                        )
+                    except Exception:
+                        r["log_identifier"] = identifier_hex
                 rows[key] = r
     except (OperationalError, InterfaceError):
         raise
@@ -887,7 +1025,7 @@ def sync(dry_run: bool=False, delete_missing: bool=True) -> Tuple[int, int, int]
     removed = 0
     errors = 0
 
-    desired: Dict[Tuple[int, str], Dict[str, Optional[str]]] = {}
+    desired: Dict[Tuple[int, str], Dict[str, Any]] = {}
     processed_subnets: Set[int] = set()
 
     for ipam_subnet, kea_subnet_id in ipam_to_kea.items():
@@ -902,27 +1040,42 @@ def sync(dry_run: bool=False, delete_missing: bool=True) -> Tuple[int, int, int]
             _warn(f"Sub-rede {ipam_subnet} sem IPs elegíveis (estáticos com MAC)")
             continue
 
-        # De-duplicar por MAC: o último item prevalece
-        uniq_by_mac = {}
+        # De-duplicar por identificador (client-id/MAC): o último item prevalece
+        uniq_by_identifier: Dict[Tuple[int, str], Dict[str, Any]] = {}
         for it in items:
-            mac = it.get("mac")
-            if mac:
-                uniq_by_mac[mac] = it
-        items = list(uniq_by_mac.values())
+            identifier_hex = it.get("identifier_hex")
+            identifier_type = int(it.get("identifier_type", 0))
+            if identifier_hex:
+                uniq_by_identifier[(identifier_type, identifier_hex)] = it
+        items = list(uniq_by_identifier.values())
 
         for it in items:
             ip = it["ip"]
-            mac = it["mac"]
+            identifier_hex = it["identifier_hex"]
+            identifier_type = int(it["identifier_type"])
+            identifier_log = it.get("log_identifier", identifier_hex)
             hostname = it.get("hostname")
             # Mantém o "estado desejado" para possível GC
-            desired[(subnet_int, ip)] = {"mac": mac, "hostname": hostname}
+            desired[(subnet_int, ip)] = {
+                "identifier_hex": identifier_hex,
+                "hostname": hostname,
+                "identifier_type": identifier_type,
+            }
 
             operation_completed = False
             last_conn_error: Optional[Exception] = None
             for attempt in range(2):
                 conn = db.ensure()
                 try:
-                    rc, msg = db_upsert_host(conn, mac, ip, subnet_int, hostname, dry_run=dry_run)
+                    rc, msg = db_upsert_host(
+                        conn,
+                        identifier_hex,
+                        ip,
+                        subnet_int,
+                        hostname,
+                        identifier_type,
+                        dry_run=dry_run,
+                    )
                 except (OperationalError, InterfaceError) as exc:
                     last_conn_error = exc
                     _warn(
@@ -941,10 +1094,12 @@ def sync(dry_run: bool=False, delete_missing: bool=True) -> Tuple[int, int, int]
                     updated += 1
                     action = "DRY-RUN" if dry_run else ""
                     prefix = f"{action} " if action else ""
-                    _info(f"{prefix}DB upsert {ip} ({mac}) subnet-id={kea_subnet_id} :: {msg}")
+                    _info(
+                        f"{prefix}DB upsert {ip} ({identifier_log}) subnet-id={kea_subnet_id} :: {msg}"
+                    )
                 else:
                     errors += 1
-                    _err(f"DB {ip}: {msg}")
+                    _err(f"DB {ip} ({identifier_log}): {msg}")
                 break
 
             if not operation_completed:
@@ -993,16 +1148,21 @@ def sync(dry_run: bool=False, delete_missing: bool=True) -> Tuple[int, int, int]
         for key, row in current.items():
             if key not in desired:
                 subnet_id, ip = key
+                identifier_type = int(row.get("dhcp_identifier_type", 0))
+                log_identifier = row.get("log_identifier") or row.get("identifier_hex")
                 if dry_run:
                     removed += 1
-                    _info(f"DRY-RUN remover {ip} subnet-id={subnet_id}")
+                    extra = f" ({log_identifier})" if log_identifier else ""
+                    _info(f"DRY-RUN remover {ip}{extra} subnet-id={subnet_id}")
                     continue
                 delete_completed = False
                 last_delete_error: Optional[Exception] = None
                 for attempt in range(2):
                     conn = db.ensure()
                     try:
-                        rc, msg = db_delete_host(conn, subnet_id, ip, dry_run=False)
+                        rc, msg = db_delete_host(
+                            conn, subnet_id, ip, identifier_type, dry_run=False
+                        )
                     except (OperationalError, InterfaceError) as exc:
                         last_delete_error = exc
                         _warn(
@@ -1019,16 +1179,19 @@ def sync(dry_run: bool=False, delete_missing: bool=True) -> Tuple[int, int, int]
                     delete_completed = True
                     if rc == 0:
                         removed += 1
-                        _info(f"Removido {ip} subnet-id={subnet_id} :: {msg}")
+                        extra = f" ({log_identifier})" if log_identifier else ""
+                        _info(f"Removido {ip}{extra} subnet-id={subnet_id} :: {msg}")
                     else:
                         errors += 1
-                        _warn(f"Erro ao remover {ip} subnet-id={subnet_id} :: {msg}")
+                        extra = f" ({log_identifier})" if log_identifier else ""
+                        _warn(f"Erro ao remover {ip}{extra} subnet-id={subnet_id} :: {msg}")
                     break
 
                 if not delete_completed and last_delete_error is not None:
                     errors += 1
+                    extra = f" ({log_identifier})" if log_identifier else ""
                     _err(
-                        f"Remoção de {ip} falhou após reconexão: {last_delete_error}"
+                        f"Remoção de {ip}{extra} falhou após reconexão: {last_delete_error}"
                     )
     elif delete_missing and not processed_subnets:
         _warn("Nenhuma sub-rede foi processada com sucesso; remoções não realizadas.")
