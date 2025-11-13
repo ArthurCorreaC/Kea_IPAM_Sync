@@ -26,6 +26,7 @@ Agora o projeto oferece dois modos de sincronização:
 - **Logs**: armazena logs da execução do script, preservando os últimos 5 dias de execução.
 - **Modo MySQL**: aplica upsert inteligente em três etapas e remove reservas órfãs do banco quando habilitado.
 - **Modo JSON**: gera um `kea-dhcp4.conf` com reservas atualizadas, mantendo a interface web do pfSense utilizável para consulta.
+- **Transferência automática**: baixa o `kea-dhcp4.conf` via SSH antes da sincronização e envia de volta após aplicar as reservas, com opção de remover o arquivo temporário local.
 
 ---
 
@@ -96,7 +97,9 @@ KEA_DB_USER=kea
 KEA_DB_PASS=
 
 # --- Modo JSON ---
-KEA_JSON_OUTPUT_PATH=/usr/local/etc/kea/kea-dhcp4.conf
+# Caminho local (opcional) para o arquivo gerado durante a sincronização
+# (por padrão será criado na pasta do script)
+KEA_JSON_OUTPUT_PATH=kea-dhcp4.conf
 # Opcional: usar um template estático como base
 # KEA_JSON_TEMPLATE_PATH=/usr/local/etc/kea/kea-dhcp4.template
 
@@ -111,6 +114,7 @@ PF_SSH_REMOTE_PATH=/usr/local/etc/kea/kea-dhcp4.conf
 # PF_SSH_RELOAD_COMMAND=sudo keactrl reload -s dhcp4
 # PF_SSH_STRICT_HOST_KEY_CHECKING=true
 # PF_SSH_EXTRA_ARGS=-o ProxyCommand="ssh jumphost -W %h:%p"
+PF_SSH_REMOVE_LOCAL_COPY=false
 RELOAD_AFTER_DB=true
 
 # --- Mapeamentos de subnet-id ---
@@ -146,8 +150,9 @@ Adicione em `crontab -e` para 5 minutos (ajuste o script conforme o modo desejad
 ```
 
 ### Execução remota para pfSense
-Ao definir `PF_SSH_HOST`, o `json_kea_ipam_sync.py` grava o arquivo atualizado localmente e, em seguida, envia o conteúdo para o pfSense usando `scp`.
-O caminho remoto padrão será o mesmo do `KEA_JSON_OUTPUT_PATH`, mas pode ser sobreposto por `PF_SSH_REMOTE_PATH`.
+Ao definir `PF_SSH_HOST`, o `json_kea_ipam_sync.py` baixa o `kea-dhcp4.conf` do pfSense via `scp`, atualiza o conteúdo localmente e, em seguida, envia o arquivo de volta com as reservas sincronizadas.
+O caminho remoto usado para leitura/escrita é o definido em `PF_SSH_REMOTE_PATH` (ou variáveis equivalentes).
+Se desejar descartar o arquivo temporário criado na pasta do script após um deploy bem-sucedido, basta ativar `PF_SSH_REMOVE_LOCAL_COPY=true`.
 Com `RELOAD_AFTER_DB=true`, o script também executa o comando configurado em `PF_SSH_RELOAD_COMMAND` (padrão `sudo keactrl reload -s dhcp4`) via SSH para aplicar as mudanças sem interromper o serviço.
 Se quiser manter o reload via Control Agent HTTP, basta deixar `PF_SSH_HOST` vazio e configurar `KEA_URL`/`KEA_USER`/`KEA_PASSWORD` normalmente.
 Quando `PF_SSH_PASSWORD` estiver definido, o script usa `sshpass` (se disponível) ou, alternativamente, a biblioteca Python `paramiko`. Instale um dos dois métodos para permitir autenticação não interativa por senha.
