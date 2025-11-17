@@ -268,13 +268,20 @@ def push_pfsense_config(
 
 
 def get_config_path_segments() -> List[str]:
-    raw = jk.env_first("PF_CONFIG_PATH", "PFSENSE_CONFIG_PATH")
     default_path = "dhcpd"
+    raw = jk.env_first("PF_CONFIG_PATH", "PFSENSE_CONFIG_PATH")
+    if raw:
+        raw = raw.strip()
     if not raw:
-        raw = default_path
+        return [default_path]
     segments = [segment.strip() for segment in raw.split(":") if segment.strip()]
     if not segments:
         raise ValueError("PF_CONFIG_PATH vazio")
+    if segments != [default_path]:
+        jk._warn(
+            "PF_CONFIG_PATH diferente de 'dhcpd' foi ignorado — o modo pfSense sempre escreve em $config['dhcpd']"
+        )
+        return [default_path]
     return segments
 
 
