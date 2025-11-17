@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Sincroniza reservas do phpIPAM diretamente com o $config do pfSense."""
+"""Sincroniza reservas do phpIPAM diretamente em static-maps nativos do pfSense."""
 
 from __future__ import annotations
 
@@ -156,17 +156,22 @@ def _php_writer_code(path_b64: str, payload_b64: str, note_b64: str) -> str:
         if ($note === false) {{
             $note = 'Atualizado via pfsense_kea_ipam_sync.py';
         }}
+        // Evita TypeError no array_path_enabled() quando notificações não existem
+        if (!isset($config['notifications']) || !is_array($config['notifications'])) {{
+            $config['notifications'] = array();
+        }}
+        if (!isset($config['notifications']['smtp']) || !is_array($config['notifications']['smtp'])) {{
+            $config['notifications']['smtp'] = array();
+        }}
         write_config($note);
 
-        // Reload do Kea/DHCP no estilo da "Opção A"
-        if (function_exists('services_kea_dhcp4_configure')) {{
-            services_kea_dhcp4_configure();
-        }} elseif (function_exists('services_kea_configure')) {{
-            services_kea_configure();
-        }} elseif (function_exists('kea_configure')) {{
-            kea_configure();
-        }} elseif (file_exists('/usr/local/sbin/rc.kea_dhcp4_configure')) {{
-            mwexec('/usr/local/sbin/rc.kea_dhcp4_configure');
+        // Reload do serviço DHCP nativo
+        if (function_exists('services_dhcpd_configure')) {{
+            services_dhcpd_configure();
+        }} elseif (function_exists('dhcpd_configure')) {{
+            dhcpd_configure();
+        }} elseif (file_exists('/usr/local/sbin/rc.dhcpd')) {{
+            mwexec('/usr/local/sbin/rc.dhcpd restart');
         }}
 
         echo base64_encode(json_encode(['ok'=>true,'changed'=>true]));
@@ -264,13 +269,98 @@ def push_pfsense_config(
 
 def get_config_path_segments() -> List[str]:
     raw = jk.env_first("PF_CONFIG_PATH", "PFSENSE_CONFIG_PATH")
-    default_path = "installedpackages:kea_dhcp4:config:0:Dhcp4"
+    default_path = "dhcpd"
     if not raw:
         raw = default_path
     segments = [segment.strip() for segment in raw.split(":") if segment.strip()]
     if not segments:
         raise ValueError("PF_CONFIG_PATH vazio")
     return segments
+
+
+def _parse_interface_mapping() -> Dict[str, str]:
+    raw = jk.env_first(
+        "PFSENSE_INTERFACE_MAP_JSON",
+        "PFSENSE_INTERFACE_MAP",
+        "SUBNET_INTERFACE_MAP_JSON",
+        "SUBNET_INTERFACE_MAP",
+        "IPAM_SUBNET_TO_INTERFACE",
+    )
+    if not raw:
+        return {}
+    raw = raw.strip()
+    mapping: Dict[str, str] = {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                if value is None:
+                    continue
+                iface = str(value).strip()
+                subnet = str(key).strip()
+                if iface and subnet:
+                    mapping[subnet] = iface
+            if mapping:
+                return mapping
+    except json.JSONDecodeError:
+        pass
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        subnet, iface = part.split(":", 1)
+        subnet = subnet.strip()
+        iface = iface.strip()
+        if subnet and iface:
+            mapping[subnet] = iface
+    return mapping
+
+
+def _build_staticmap_entry(item: Dict[str, Any]) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {"ipaddr": item["ip"]}
+    identifier_hex = item["identifier_hex"].lower()
+    identifier_type = int(item.get("identifier_type", 0))
+    if identifier_type == 0:
+        entry["mac"] = jk._group_hex_pairs(identifier_hex)
+    else:
+        entry["cid"] = jk._group_hex_pairs(identifier_hex)
+    hostname = item.get("hostname")
+    if hostname:
+        entry["hostname"] = hostname
+        entry["descr"] = hostname
+    return entry
+
+
+def _apply_staticmaps(
+    dhcpd_config: Dict[str, Any],
+    staticmaps_by_iface: Dict[str, List[Dict[str, Any]]],
+    delete_missing: bool,
+) -> Tuple[int, int]:
+    interfaces_modified = 0
+    total_mappings = 0
+
+    for iface, entries in staticmaps_by_iface.items():
+        iface_section = dhcpd_config.get(iface)
+        if not isinstance(iface_section, dict):
+            iface_section = {}
+            dhcpd_config[iface] = iface_section
+        current = iface_section.get("staticmap")
+        if not isinstance(current, list):
+            current = []
+        if entries or delete_missing:
+            if current != entries:
+                iface_section["staticmap"] = entries
+                interfaces_modified += 1
+                jk._info(
+                    f"Atualizadas {len(entries)} reservas para interface={iface}"
+                )
+        else:
+            jk._debug(
+                f"Interface {iface} não recebeu reservas e --skip-delete está ativo; mantendo static-maps atuais"
+            )
+        total_mappings += len(entries)
+
+    return total_mappings, interfaces_modified
 
 
 def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, int]:
@@ -301,47 +391,45 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             jk._err("Configure PHPIPAM_TOKEN ou PHPIPAM_USERNAME/PHPIPAM_PASSWORD no .env.")
             return (0, 0, 1)
 
-    ipam_to_kea = jk.parse_mapping_env(
-        "SUBNET_ID_MAP_JSON",
-        "SUBNET_ID_MAP",
-        "IPAM_SUBNETID_TO_ID",
-    )
-    if not ipam_to_kea:
+    ipam_to_iface = _parse_interface_mapping()
+    if not ipam_to_iface:
         jk._err(
-            "Configure SUBNET_ID_MAP_JSON (ou SUBNET_ID_MAP/IPAM_SUBNETID_TO_ID) no .env. "
-            "Exemplo: {\"39\":188,\"40\":189} ou 39:188,40:189"
+            "Configure PFSENSE_INTERFACE_MAP_JSON (ou PFSENSE_INTERFACE_MAP/SUBNET_INTERFACE_MAP) no .env. "
+            "Exemplo: {\"39\":\"lan\",\"40\":\"vlan207\"} ou 39:lan,40:vlan207"
         )
         return (0, 0, 1)
 
-    template_path = jk.env_first("KEA_JSON_TEMPLATE_PATH", "KEA_CONFIG_TEMPLATE_PATH")
-    output_candidate = jk.env_first("KEA_JSON_OUTPUT_PATH", "KEA_CONFIG_PATH", default="")
-
     ssh_settings = jk._load_ssh_settings()
     path_segments = get_config_path_segments()
-    remote_config = fetch_pfsense_config(path_segments, ssh_settings)
-    if remote_config is not None:
-        config = remote_config
-    else:
-        config = jk.load_base_config(template_path, output_candidate or "")
-
-    reservations_by_subnet: Dict[int, List[Dict[str, Any]]] = {}
-    processed_subnets: Set[int] = set()
     errors = 0
+    remote_config = fetch_pfsense_config(path_segments, ssh_settings)
+    if remote_config is None:
+        jk._err("Não foi possível ler a configuração DHCP atual do pfSense; abortando para evitar sobrescrita.")
+        return (0, 0, 1)
 
-    for ipam_subnet, kea_subnet_id in ipam_to_kea.items():
+    config = remote_config
+
+    staticmaps_by_iface: Dict[str, List[Dict[str, Any]]] = {}
+    processed_ifaces: Set[str] = set()
+
+    for ipam_subnet, iface_name in ipam_to_iface.items():
         rc, data = jk.ipam_get_addresses(base, token, str(ipam_subnet), verify_tls)
         if rc != 0 or data is None:
             errors += 1
             continue
-        subnet_int = int(kea_subnet_id)
-        processed_subnets.add(subnet_int)
+        iface = str(iface_name).strip()
+        if not iface:
+            jk._warn(f"Interface vazia mapeada para sub-rede {ipam_subnet}; ignorando.")
+            errors += 1
+            continue
+        processed_ifaces.add(iface)
         items = jk.build_items_from_ipam(data)
 
         if not items:
             msg = f"Sub-rede {ipam_subnet} sem IPs elegíveis (estáticos com MAC/client-id)"
             if delete_missing:
                 jk._warn(msg)
-                reservations_by_subnet[subnet_int] = []
+                staticmaps_by_iface[iface] = []
             else:
                 jk._debug(msg + " — preservando reservas atuais")
             continue
@@ -363,50 +451,50 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
         except Exception:
             items.sort(key=lambda it: it.get("ip", ""))
 
-        reservations = [jk.reservation_from_item(it) for it in items]
-        reservations_by_subnet[subnet_int] = reservations
+        reservations = [_build_staticmap_entry(it) for it in items]
+        staticmaps_by_iface[iface] = reservations
 
         for it in items:
             identifier_log = it.get("log_identifier", it["identifier_hex"])
             jk._info(
-                f"Reserva preparada {it['ip']} ({identifier_log}) subnet-id={kea_subnet_id}"
+                f"Reserva preparada {it['ip']} ({identifier_log}) interface={iface}"
             )
 
-    if not processed_subnets:
-        jk._warn("Nenhuma sub-rede foi processada com sucesso; nada para escrever.")
+    if not processed_ifaces:
+        jk._warn("Nenhuma interface foi processada com sucesso; nada para escrever.")
         return (0, 0, errors if errors else 1)
 
-    total_reservations, subnets_modified = jk.apply_reservations(
-        config, reservations_by_subnet, delete_missing
+    total_reservations, interfaces_modified = _apply_staticmaps(
+        config, staticmaps_by_iface, delete_missing
     )
 
     if dry_run:
         jk._info(
-            f"DRY-RUN: {total_reservations} reservas seriam gravadas em {subnets_modified} sub-redes"
+            f"DRY-RUN: {total_reservations} reservas seriam gravadas em {interfaces_modified} interfaces"
         )
-        return (total_reservations, subnets_modified, errors)
+        return (total_reservations, interfaces_modified, errors)
 
-    if subnets_modified <= 0:
+    if interfaces_modified <= 0:
         jk._info("Nenhuma alteração detectada — pfSense já estava sincronizado")
-        return (total_reservations, subnets_modified, errors)
+        return (total_reservations, interfaces_modified, errors)
 
     note = jk.env_first("PF_CONFIG_WRITE_NOTE", "PFSENSE_CONFIG_NOTE", default="Kea_IPAM_Sync") or "Kea_IPAM_Sync"
     success, changed = push_pfsense_config(config, path_segments, ssh_settings, note)
     if not success:
         errors += 1
-        return (total_reservations, subnets_modified, errors)
+        return (total_reservations, interfaces_modified, errors)
 
     if changed:
         jk._info("Configuração do pfSense atualizada e serviço recarregado")
     else:
         jk._info("pfSense já possuía a mesma configuração — sem reload adicional")
 
-    return (total_reservations, subnets_modified, errors)
+    return (total_reservations, interfaces_modified, errors)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Sincroniza reservas do phpIPAM diretamente no pfSense ($config)"
+        description="Sincroniza reservas do phpIPAM diretamente como static-maps DHCP do pfSense"
     )
     parser.add_argument(
         "--dry-run",
@@ -426,7 +514,7 @@ def main() -> int:
     jk.setup_logging(force=True)
 
     start = time.time()
-    total_reservations, subnets_modified, errors = sync(
+    total_reservations, interfaces_modified, errors = sync(
         dry_run=args.dry_run,
         delete_missing=not getattr(args, "skip_delete", False),
     )
@@ -435,7 +523,7 @@ def main() -> int:
     print()
     jk._log(
         jk.logging.INFO,
-        f"Resumo: reservas={total_reservations}, sub-redes alteradas={subnets_modified}, erros={errors}  ({elapsed:.2f}s)",
+        f"Resumo: reservas={total_reservations}, interfaces alteradas={interfaces_modified}, erros={errors}  ({elapsed:.2f}s)",
     )
 
     return 0 if errors == 0 else 1
