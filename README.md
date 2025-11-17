@@ -1,16 +1,18 @@
 # 📘 Kea_IPAM_Sync
 
 Sincronização automática de reservas DHCP entre **phpIPAM** e **Kea DHCP**.
-Agora o projeto oferece dois modos de sincronização:
+Agora o projeto oferece três modos de sincronização:
 
 - `mysql_kea_ipam_sync.py`: grava diretamente na tabela `hosts` do banco MySQL usado pelo Kea.
 - `json_kea_ipam_sync.py`: gera/atualiza um arquivo `kea-dhcp4.conf`, ideal para ambientes como o **pfSense** que usam o Kea com backend em arquivo JSON.
+- `pfsense_kea_ipam_sync.py`: atualiza o `$config` do pfSense (config.xml) por meio de PHP, mantendo a interface web sincronizada.
 
 ## 🚀 Visão Geral
 - Consulta endereços no **phpIPAM** marcados com o campo custom `kea_reserve`.
-- Permite sincronizar de duas formas:
+- Permite sincronizar de três formas:
   - **MySQL**: realiza operações `INSERT`, `UPDATE` e `DELETE` na tabela `hosts` do Kea (via `mysql_kea_ipam_sync.py`).
   - **JSON**: escreve as reservas dentro de um `kea-dhcp4.conf` compatível com o Kea/pfSense (via `json_kea_ipam_sync.py`).
+  - **pfSense ($config)**: envia a configuração diretamente para o `config.xml` do pfSense usando `pfsense_kea_ipam_sync.py`.
 - Suporta execução periódica via **Cron**, garantindo sincronização contínua.
 - Mantém o Kea DHCP alinhado ao estado desejado do IPAM, seja via banco ou arquivo.
 
@@ -26,7 +28,7 @@ Agora o projeto oferece dois modos de sincronização:
 - **Logs**: armazena logs da execução do script, preservando os últimos 5 dias de execução.
 - **Modo MySQL**: aplica upsert inteligente em três etapas e remove reservas órfãs do banco quando habilitado.
 - **Modo JSON**: gera um `kea-dhcp4.conf` com reservas atualizadas, mantendo a interface web do pfSense utilizável para consulta.
-- **Transferência automática**: baixa o `kea-dhcp4.conf` via SSH antes da sincronização e envia de volta após aplicar as reservas, com opção de remover o arquivo temporário local.
+- **Modo pfSense ($config)**: publica as reservas direto no `config.xml` (via PHP) para que o pfSense enxergue os leases nas telas oficiais.
 
 ---
 
@@ -35,6 +37,7 @@ Agora o projeto oferece dois modos de sincronização:
 kea_ipam_sync/
 ├── mysql_kea_ipam_sync.py  # Sincronização com banco MySQL do Kea
 ├── json_kea_ipam_sync.py   # Sincronização gerando arquivo kea-dhcp4.conf
+├── pfsense_kea_ipam_sync.py # Sincronização atualizando o $config do pfSense
 ├── .env                  # Configurações de ambiente
 ├── .env.example          # Exemplo de Configurações de ambiente
 ├── logs/                 # Pasta de logs de execução do projeto
@@ -117,6 +120,10 @@ PF_SSH_REMOTE_PATH=/usr/local/etc/kea/kea-dhcp4.conf
 PF_SSH_REMOVE_LOCAL_COPY=false
 RELOAD_AFTER_DB=true
 
+# --- pfSense ($config) ---
+PF_CONFIG_PATH=installedpackages:kea_dhcp4:config:0:Dhcp4
+PF_CONFIG_WRITE_NOTE=Atualizado via Kea_IPAM_Sync
+
 # --- Mapeamentos de subnet-id ---
 SUBNET_ID_MAP_JSON={"39":188}
 
@@ -139,6 +146,10 @@ python3 mysql_kea_ipam_sync.py
 # Modo JSON
 python3 json_kea_ipam_sync.py --dry-run
 python3 json_kea_ipam_sync.py
+
+# Modo pfSense ($config)
+python3 pfsense_kea_ipam_sync.py --dry-run
+python3 pfsense_kea_ipam_sync.py
 ```
 
 ### Execução automática (Cron)
@@ -147,6 +158,8 @@ Adicione em `crontab -e` para 5 minutos (ajuste o script conforme o modo desejad
 */5 * * * * cd /caminho/Kea_IPAM_Sync && /caminho/Kea_IPAM_Sync/venv/bin/python mysql_kea_ipam_sync.py --env /caminho/Kea_IPAM_Sync/.env
 # ou
 */5 * * * * cd /caminho/Kea_IPAM_Sync && /caminho/Kea_IPAM_Sync/venv/bin/python json_kea_ipam_sync.py --env /caminho/Kea_IPAM_Sync/.env
+# ou
+*/5 * * * * cd /caminho/Kea_IPAM_Sync && /caminho/Kea_IPAM_Sync/venv/bin/python pfsense_kea_ipam_sync.py --env /caminho/Kea_IPAM_Sync/.env
 ```
 
 ### Execução remota para pfSense
@@ -156,6 +169,11 @@ Se desejar descartar o arquivo temporário criado na pasta do script após um de
 Com `RELOAD_AFTER_DB=true`, o script também executa o comando configurado em `PF_SSH_RELOAD_COMMAND` (padrão `sudo keactrl reload -s dhcp4`) via SSH para aplicar as mudanças sem interromper o serviço.
 Se quiser manter o reload via Control Agent HTTP, basta deixar `PF_SSH_HOST` vazio e configurar `KEA_URL`/`KEA_USER`/`KEA_PASSWORD` normalmente.
 Quando `PF_SSH_PASSWORD` estiver definido, o script usa `sshpass` (se disponível) ou, alternativamente, a biblioteca Python `paramiko`. Instale um dos dois métodos para permitir autenticação não interativa por senha.
+
+O `pfsense_kea_ipam_sync.py` reutiliza exatamente essas mesmas variáveis para executar comandos PHP diretamente no firewall. Caso nenhum `PF_SSH_HOST` seja informado, o script supõe que está rodando dentro do próprio pfSense (onde o binário `php` já está presente).
+
+#### Escolhendo o nó no `$config`
+Defina `PF_CONFIG_PATH` para apontar o caminho até a estrutura que representa o `Dhcp4` (por exemplo `installedpackages:kea_dhcp4:config:0:Dhcp4`). Use dois pontos (`:`) para separar cada nível do array `$config`. O script lê esse nó antes de aplicar qualquer alteração, compara com o que veio do phpIPAM e só executa `write_config()` + `services_kea_*_configure()` quando detectar um `update`. Se nada mudar, apenas um log é emitido e o reload é pulado.
 
 ---
 
