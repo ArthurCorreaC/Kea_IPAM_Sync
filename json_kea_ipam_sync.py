@@ -451,6 +451,94 @@ def _deploy_via_scp(
     return True, ""
 
 
+def _paramiko_fetch(
+    settings: Dict[str, Any], remote_path: str, local_path: str
+) -> Tuple[bool, str]:
+    client, error = _paramiko_connect(settings)
+    if client is None:
+        return False, error or "falha ao inicializar conexão Paramiko"
+    try:
+        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+        try:
+            with client.open_sftp() as sftp:
+                sftp.get(remote_path, local_path)
+        except FileNotFoundError:
+            return False, "arquivo remoto não encontrado"
+        except Exception as exc:
+            return False, str(exc)
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        client.close()
+    return True, ""
+
+
+def _fetch_via_scp(
+    settings: Dict[str, Any], remote_path: str, local_path: str
+) -> Tuple[bool, str]:
+    transport = settings.get("_transport", "ssh")
+    if transport == "unsupported":
+        return False, "Autenticação por senha requer 'sshpass' ou biblioteca 'paramiko'"
+    if transport == "paramiko":
+        return _paramiko_fetch(settings, remote_path, local_path)
+    target = f"{_build_ssh_base(settings)}:{remote_path}"
+    args = ["scp", *_ssh_common_args(settings, for_scp=True), target, local_path]
+    args, env = _wrap_ssh_with_password(settings, args)
+    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+    except FileNotFoundError:
+        missing = args[0]
+        if missing == "sshpass":
+            return False, "Comando 'sshpass' não encontrado no PATH"
+        return False, "Comando 'scp' não encontrado no PATH"
+    if proc.returncode != 0:
+        msg = proc.stderr.strip() or proc.stdout.strip() or "falha desconhecida"
+        return False, msg
+    return True, ""
+
+
+def _resolve_remote_path(default_remote_path: Optional[str] = None) -> Optional[str]:
+    remote_path = env_first(
+        "PF_SSH_REMOTE_PATH",
+        "PFSENSE_REMOTE_CONFIG_PATH",
+        "KEA_REMOTE_CONFIG_PATH",
+    )
+    if remote_path:
+        remote_path = remote_path.strip()
+        if remote_path:
+            return remote_path
+    if default_remote_path:
+        default_remote_path = default_remote_path.strip()
+        if default_remote_path and default_remote_path.startswith("/"):
+            return default_remote_path
+    return None
+
+
+def fetch_config_from_pfsense(
+    local_path: str, default_remote_path: str
+) -> Tuple[bool, bool]:
+    settings = _load_ssh_settings()
+    if not settings:
+        return (False, True)
+    remote_path = _resolve_remote_path(default_remote_path)
+    if not remote_path:
+        _err("PF_SSH_REMOTE_PATH não configurado e caminho remoto padrão inválido")
+        return (True, False)
+    ok, message = _fetch_via_scp(settings, remote_path, local_path)
+    if not ok:
+        _err(f"Falha ao baixar arquivo do pfSense: {message}")
+        return (True, False)
+    _info(f"Arquivo baixado do pfSense: {remote_path}")
+    return (True, True)
+
+
 def _ensure_remote_directory(settings: Dict[str, Any], remote_path: str) -> bool:
     transport = settings.get("_transport", "ssh")
     if transport == "unsupported":
@@ -475,17 +563,9 @@ def deploy_config_to_pfsense(local_path: str, default_remote_path: str) -> Tuple
     settings = _load_ssh_settings()
     if not settings:
         return (False, True)
-    remote_path = env_first(
-        "PF_SSH_REMOTE_PATH",
-        "PFSENSE_REMOTE_CONFIG_PATH",
-        "KEA_REMOTE_CONFIG_PATH",
-    )
-    if remote_path:
-        remote_path = remote_path.strip()
+    remote_path = _resolve_remote_path(default_remote_path)
     if not remote_path:
-        remote_path = default_remote_path
-    if not remote_path:
-        _err("PF_SSH_REMOTE_PATH não configurado e caminho local vazio")
+        _err("PF_SSH_REMOTE_PATH não configurado e caminho remoto padrão inválido")
         return (True, False)
 
     transport = settings.get("_transport", "ssh")
@@ -1041,11 +1121,19 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
     output_path = env_first("KEA_JSON_OUTPUT_PATH", "KEA_CONFIG_PATH", default="kea-dhcp4.conf")
     template_path = env_first("KEA_JSON_TEMPLATE_PATH", "KEA_CONFIG_TEMPLATE_PATH")
 
+    fetched_remote = False
+    errors = 0
+    fetch_attempted, fetch_ok = fetch_config_from_pfsense(output_path, output_path)
+    if fetch_attempted:
+        if not fetch_ok:
+            errors += 1
+        else:
+            fetched_remote = True
+
     config = load_base_config(template_path, output_path)
 
     reservations_by_subnet: Dict[int, List[Dict[str, Any]]] = {}
     processed_subnets: Set[int] = set()
-    errors = 0
 
     for ipam_subnet, kea_subnet_id in ipam_to_kea.items():
         rc, data = ipam_get_addresses(base, token, str(ipam_subnet), verify_tls)
@@ -1123,6 +1211,17 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             _warn("PULANDO reload: envio via SSH falhou")
     else:
         _debug("PULANDO reload: nada mudou")
+
+    remove_local = parse_bool(
+        env_first("PF_SSH_REMOVE_LOCAL_COPY", "PFSENSE_REMOVE_LOCAL_COPY"),
+        default=False,
+    )
+    if remove_local and fetched_remote and (not remote_attempted or remote_ok):
+        try:
+            os.remove(output_path)
+            _info(f"Arquivo local temporário removido: {output_path}")
+        except OSError as exc:
+            _warn(f"Falha ao remover arquivo local temporário {output_path}: {exc}")
 
     return (total_reservations, subnets_modified, errors)
 
