@@ -37,7 +37,6 @@ def _php_reader_code(path_b64: str) -> str:
         @ini_set('display_errors','0');
         require_once('/etc/inc/config.inc');
         @require_once('/etc/inc/services.inc');
-        @require_once('/etc/inc/kea.inc');
         $segments = json_decode(base64_decode('{path_b64}'), true);
         if (!is_array($segments)) {{
             $segments = array();
@@ -80,7 +79,6 @@ def _php_writer_code(path_b64: str, payload_b64: str, note_b64: str) -> str:
         @ini_set('display_errors','0');
         require_once('/etc/inc/config.inc');
         @require_once('/etc/inc/services.inc');
-        @require_once('/etc/inc/kea.inc');
         $segments = json_decode(base64_decode('{path_b64}'), true);
         if (!is_array($segments) || empty($segments)) {{
             echo base64_encode(json_encode(['ok'=>false,'error'=>'config path vazio']));
@@ -159,13 +157,18 @@ def _php_writer_code(path_b64: str, payload_b64: str, note_b64: str) -> str:
             $note = 'Atualizado via pfsense_kea_ipam_sync.py';
         }}
         write_config($note);
+
+        // Reload do Kea/DHCP no estilo da "Opção A"
         if (function_exists('services_kea_dhcp4_configure')) {{
             services_kea_dhcp4_configure();
         }} elseif (function_exists('services_kea_configure')) {{
             services_kea_configure();
         }} elseif (function_exists('kea_configure')) {{
             kea_configure();
+        }} elseif (file_exists('/usr/local/sbin/rc.kea_dhcp4_configure')) {{
+            mwexec('/usr/local/sbin/rc.kea_dhcp4_configure');
         }}
+
         echo base64_encode(json_encode(['ok'=>true,'changed'=>true]));
         """
     )
