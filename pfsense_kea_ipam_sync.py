@@ -278,42 +278,146 @@ def get_config_path_segments() -> List[str]:
     return segments
 
 
-def _parse_interface_mapping() -> Dict[str, str]:
-    raw = jk.env_first(
-        "PFSENSE_INTERFACE_MAP_JSON",
-        "PFSENSE_INTERFACE_MAP",
-        "SUBNET_INTERFACE_MAP_JSON",
-        "SUBNET_INTERFACE_MAP",
-        "IPAM_SUBNET_TO_INTERFACE",
+def _parse_ipam_subnet_ids() -> List[str]:
+    mapping = jk.parse_mapping_env(
+        "SUBNET_ID_MAP_JSON",
+        "SUBNET_ID_MAP",
+        "IPAM_SUBNETID_TO_ID",
     )
+    if mapping:
+        return [str(key) for key in mapping.keys()]
+    raw = jk.env_first("IPAM_SUBNET_IDS", "PHPIPAM_SUBNET_IDS")
     if not raw:
-        return {}
-    raw = raw.strip()
-    mapping: Dict[str, str] = {}
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _network_from_ip_and_mask(
+    ipaddr: Optional[str], mask: Optional[str]
+) -> Optional[ipaddress.IPv4Network]:
+    if not ipaddr or not mask:
+        return None
     try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            for key, value in parsed.items():
-                if value is None:
-                    continue
-                iface = str(value).strip()
-                subnet = str(key).strip()
-                if iface and subnet:
-                    mapping[subnet] = iface
-            if mapping:
-                return mapping
-    except json.JSONDecodeError:
+        ipaddress.IPv4Address(str(ipaddr))
+    except Exception:
+        return None
+    mask_s = str(mask).strip()
+    if not mask_s:
+        return None
+    try:
+        prefix = int(mask_s)
+        return ipaddress.IPv4Interface(f"{ipaddr}/{prefix}").network
+    except Exception:
         pass
-    for part in raw.split(","):
-        part = part.strip()
-        if not part or ":" not in part:
+    try:
+        return ipaddress.IPv4Network((str(ipaddr), mask_s), strict=False)
+    except Exception:
+        return None
+
+
+def _build_iface_network_index(
+    interfaces_config: Dict[str, Any]
+) -> Dict[str, ipaddress.IPv4Network]:
+    index: Dict[str, ipaddress.IPv4Network] = {}
+    for iface, data in interfaces_config.items():
+        if not isinstance(data, dict):
             continue
-        subnet, iface = part.split(":", 1)
-        subnet = subnet.strip()
-        iface = iface.strip()
-        if subnet and iface:
-            mapping[subnet] = iface
-    return mapping
+        ipaddr = data.get("ipaddr")
+        mask = data.get("subnet") or data.get("subnetmask")
+        network = _network_from_ip_and_mask(ipaddr, mask)
+        if network is None:
+            continue
+        index[str(iface)] = network
+    return index
+
+
+def _match_ip_to_iface(
+    ip_s: str, iface_networks: Dict[str, ipaddress.IPv4Network]
+) -> Optional[str]:
+    try:
+        addr = ipaddress.IPv4Address(ip_s)
+    except Exception:
+        return None
+    for iface, network in iface_networks.items():
+        if addr in network:
+            return iface
+    return None
+
+
+def _match_network_to_iface(
+    target: ipaddress.IPv4Network,
+    iface_networks: Dict[str, ipaddress.IPv4Network],
+) -> Optional[str]:
+    for iface, network in iface_networks.items():
+        if target == network or target.subnet_of(network) or network.subnet_of(target):
+            return iface
+    return None
+
+
+def _fetch_ipam_subnet_network(
+    base: str,
+    token: str,
+    subnet_id: str,
+    verify_tls: bool,
+    cache: Dict[str, Optional[ipaddress.IPv4Network]],
+) -> Optional[ipaddress.IPv4Network]:
+    if subnet_id in cache:
+        return cache[subnet_id]
+    rc, data = jk.ipam_get_subnet(base, token, subnet_id, verify_tls)
+    network: Optional[ipaddress.IPv4Network] = None
+    if rc == 0 and data:
+        subnet = data.get("subnet")
+        mask = data.get("mask") or data.get("subnetmask")
+        try:
+            if subnet and mask:
+                network = ipaddress.IPv4Network(f"{subnet}/{mask}", strict=False)
+        except Exception as exc:
+            jk._warn(
+                f"Não foi possível interpretar a rede do phpIPAM para sub-rede {subnet_id}: {exc}"
+            )
+    else:
+        jk._warn(f"phpIPAM não retornou detalhes para a sub-rede {subnet_id}")
+    cache[subnet_id] = network
+    return network
+
+
+def _determine_interface_for_subnet(
+    subnet_id: str,
+    items: List[Dict[str, Any]],
+    iface_networks: Dict[str, ipaddress.IPv4Network],
+    base: str,
+    token: str,
+    verify_tls: bool,
+    network_cache: Dict[str, Optional[ipaddress.IPv4Network]],
+) -> Optional[str]:
+    matches: Dict[str, int] = {}
+    for item in items:
+        ip_s = item.get("ip")
+        if not ip_s:
+            continue
+        iface = _match_ip_to_iface(ip_s, iface_networks)
+        if iface:
+            matches[iface] = matches.get(iface, 0) + 1
+    if matches:
+        iface, _ = max(matches.items(), key=lambda kv: kv[1])
+        if len(matches) > 1:
+            jk._warn(
+                f"Sub-rede {subnet_id} tem IPs espalhados em múltiplas interfaces {list(matches.keys())}; usando {iface}"
+            )
+        return iface
+    network = _fetch_ipam_subnet_network(base, token, subnet_id, verify_tls, network_cache)
+    if network:
+        iface = _match_network_to_iface(network, iface_networks)
+        if iface:
+            return iface
+        jk._warn(
+            f"Rede {network} da sub-rede {subnet_id} não corresponde a nenhum DHCP ativo no pfSense"
+        )
+    else:
+        jk._warn(
+            f"Não foi possível descobrir a rede da sub-rede {subnet_id}; defina IPs ou revise o phpIPAM"
+        )
+    return None
 
 
 def _build_staticmap_entry(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -391,11 +495,10 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             jk._err("Configure PHPIPAM_TOKEN ou PHPIPAM_USERNAME/PHPIPAM_PASSWORD no .env.")
             return (0, 0, 1)
 
-    ipam_to_iface = _parse_interface_mapping()
-    if not ipam_to_iface:
+    ipam_subnet_ids = _parse_ipam_subnet_ids()
+    if not ipam_subnet_ids:
         jk._err(
-            "Configure PFSENSE_INTERFACE_MAP_JSON (ou PFSENSE_INTERFACE_MAP/SUBNET_INTERFACE_MAP) no .env. "
-            "Exemplo: {\"39\":\"lan\",\"40\":\"vlan207\"} ou 39:lan,40:vlan207"
+            "Configure SUBNET_ID_MAP_JSON (ou SUBNET_ID_MAP/IPAM_SUBNETID_TO_ID) no .env para listar as sub-redes do phpIPAM a sincronizar."
         )
         return (0, 0, 1)
 
@@ -407,32 +510,31 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
         jk._err("Não foi possível ler a configuração DHCP atual do pfSense; abortando para evitar sobrescrita.")
         return (0, 0, 1)
 
+    interfaces_config = fetch_pfsense_config(["interfaces"], ssh_settings)
+    if interfaces_config is None:
+        jk._err("Não foi possível ler $config['interfaces'] no pfSense; necessário para localizar as redes de cada interface.")
+        return (0, 0, 1)
+
+    iface_networks = _build_iface_network_index(interfaces_config)
+    if not iface_networks:
+        jk._err("Nenhuma interface com IPv4 válido encontrada no pfSense; habilite DHCP nas VLANs desejadas antes de sincronizar.")
+        return (0, 0, 1)
+
     config = remote_config
 
-    staticmaps_by_iface: Dict[str, List[Dict[str, Any]]] = {}
+    iface_results: Dict[str, Dict[str, Any]] = {}
     processed_ifaces: Set[str] = set()
+    subnet_network_cache: Dict[str, Optional[ipaddress.IPv4Network]] = {}
 
-    for ipam_subnet, iface_name in ipam_to_iface.items():
+    for ipam_subnet in ipam_subnet_ids:
         rc, data = jk.ipam_get_addresses(base, token, str(ipam_subnet), verify_tls)
         if rc != 0 or data is None:
             errors += 1
             continue
-        iface = str(iface_name).strip()
-        if not iface:
-            jk._warn(f"Interface vazia mapeada para sub-rede {ipam_subnet}; ignorando.")
-            errors += 1
-            continue
-        processed_ifaces.add(iface)
         items = jk.build_items_from_ipam(data)
 
         if not items:
-            msg = f"Sub-rede {ipam_subnet} sem IPs elegíveis (estáticos com MAC/client-id)"
-            if delete_missing:
-                jk._warn(msg)
-                staticmaps_by_iface[iface] = []
-            else:
-                jk._debug(msg + " — preservando reservas atuais")
-            continue
+            items = []
 
         uniq_by_identifier: Dict[Tuple[int, str], Dict[str, Any]] = {}
         for it in items:
@@ -451,10 +553,67 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
         except Exception:
             items.sort(key=lambda it: it.get("ip", ""))
 
-        reservations = [_build_staticmap_entry(it) for it in items]
-        staticmaps_by_iface[iface] = reservations
+        iface = _determine_interface_for_subnet(
+            str(ipam_subnet), items, iface_networks, base, token, verify_tls, subnet_network_cache
+        )
+        if not iface:
+            jk._err(
+                f"Não foi possível associar a sub-rede {ipam_subnet} a nenhuma interface do pfSense; confira o config.xml e as VLANs."
+            )
+            errors += 1
+            continue
 
+        processed_ifaces.add(iface)
+        iface_network = iface_networks.get(iface)
+
+        if not items:
+            msg = f"Sub-rede {ipam_subnet} sem IPs elegíveis (estáticos com MAC/client-id)"
+            if delete_missing:
+                jk._warn(msg)
+                entry = iface_results.setdefault(
+                    iface, {"reservations": [], "delete": False}
+                )
+                entry["delete"] = True
+            else:
+                jk._debug(msg + " — preservando reservas atuais")
+            continue
+
+        filtered_items: List[Dict[str, Any]] = []
         for it in items:
+            if iface_network and it.get("ip"):
+                try:
+                    ip_val = ipaddress.IPv4Address(it["ip"])
+                    if ip_val not in iface_network:
+                        jk._warn(
+                            f"Ignorado {it['ip']} da sub-rede {ipam_subnet}: fora da rede {iface_network} da interface {iface}"
+                        )
+                        continue
+                except Exception:
+                    jk._warn(f"Ignorado IP inválido {it.get('ip')} na sub-rede {ipam_subnet}")
+                    continue
+            filtered_items.append(it)
+
+        if not filtered_items:
+            msg = (
+                f"Sub-rede {ipam_subnet} não possui IPs dentro da rede {iface_network} (interface {iface})"
+                if iface_network
+                else f"Sub-rede {ipam_subnet} não possui IPs compatíveis com a interface {iface}"
+            )
+            if delete_missing:
+                jk._warn(msg)
+                entry = iface_results.setdefault(
+                    iface, {"reservations": [], "delete": False}
+                )
+                entry["delete"] = True
+            else:
+                jk._debug(msg + " — preservando reservas atuais")
+            continue
+
+        reservations = [_build_staticmap_entry(it) for it in filtered_items]
+        entry = iface_results.setdefault(iface, {"reservations": [], "delete": False})
+        entry["reservations"].extend(reservations)
+
+        for it in filtered_items:
             identifier_log = it.get("log_identifier", it["identifier_hex"])
             jk._info(
                 f"Reserva preparada {it['ip']} ({identifier_log}) interface={iface}"
@@ -463,6 +622,14 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
     if not processed_ifaces:
         jk._warn("Nenhuma interface foi processada com sucesso; nada para escrever.")
         return (0, 0, errors if errors else 1)
+
+    staticmaps_by_iface: Dict[str, List[Dict[str, Any]]] = {}
+    for iface, result in iface_results.items():
+        reservations = result.get("reservations") or []
+        if reservations:
+            staticmaps_by_iface[iface] = reservations
+        elif delete_missing and result.get("delete"):
+            staticmaps_by_iface[iface] = []
 
     total_reservations, interfaces_modified = _apply_staticmaps(
         config, staticmaps_by_iface, delete_missing

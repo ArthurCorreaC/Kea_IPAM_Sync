@@ -121,10 +121,12 @@ PF_SSH_REMOVE_LOCAL_COPY=false
 RELOAD_AFTER_DB=true
 
 # --- pfSense ($config) ---
-PF_CONFIG_PATH=installedpackages:kea_dhcp4:config:0:Dhcp4
+# Use "dhcpd" para o serviço nativo ou um caminho customizado separado por dois pontos
+PF_CONFIG_PATH=dhcpd
 PF_CONFIG_WRITE_NOTE=Atualizado via Kea_IPAM_Sync
 
 # --- Mapeamentos de subnet-id ---
+# (as chaves definem as sub-redes buscadas; no modo pfSense a interface é descoberta automaticamente)
 SUBNET_ID_MAP_JSON={"39":188}
 
 # --- (Opcional) Control Agent ---
@@ -173,7 +175,9 @@ Quando `PF_SSH_PASSWORD` estiver definido, o script usa `sshpass` (se disponíve
 O `pfsense_kea_ipam_sync.py` reutiliza exatamente essas mesmas variáveis para executar comandos PHP diretamente no firewall. Caso nenhum `PF_SSH_HOST` seja informado, o script supõe que está rodando dentro do próprio pfSense (onde o binário `php` já está presente).
 
 #### Escolhendo o nó no `$config`
-Defina `PF_CONFIG_PATH` para apontar o caminho até a estrutura que representa o `Dhcp4` (por exemplo `installedpackages:kea_dhcp4:config:0:Dhcp4`). Use dois pontos (`:`) para separar cada nível do array `$config`. O script lê esse nó antes de aplicar qualquer alteração, compara com o que veio do phpIPAM e só executa `write_config()` + `services_kea_*_configure()` quando detectar um `update`. Se nada mudar, apenas um log é emitido e o reload é pulado.
+Defina `PF_CONFIG_PATH` para apontar o caminho até a estrutura que representa o DHCP. Para o serviço nativo, basta usar `dhcpd` (padrão). Se estiver usando outra árvore, mantenha o formato `nivel1:nivel2:...`. O script lê esse nó antes de aplicar qualquer alteração, compara com o que veio do phpIPAM e só executa `write_config()` + o reload do serviço DHCP quando detectar um `update`. Se nada mudar, apenas um log é emitido e o reload é pulado.
+
+O `pfsense_kea_ipam_sync.py` também aproveita as chaves configuradas em `SUBNET_ID_MAP_JSON` (ou equivalentes) para buscar as sub-redes no phpIPAM e cruza cada IP com os dados de `$config['interfaces']`. Dessa forma ele descobre automaticamente qual interface DHCP deve receber as reservas, eliminando a necessidade de mapear `lan`, `vlanX` etc. manualmente.
 
 ---
 
