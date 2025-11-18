@@ -38,26 +38,26 @@ def _php_reader_code(path_b64: str) -> str:
         require_once('/etc/inc/config.inc');
         @require_once('/etc/inc/services.inc');
         $segments = json_decode(base64_decode('{path_b64}'), true);
-        if (!is_array($segments)) {{
+        if (is_array($segments) == false) {{
             $segments = array();
         }}
         $value = $config;
         foreach ($segments as $segment) {{
             $segment = (string)$segment;
             $is_index = ctype_digit($segment);
-            if (!is_array($value)) {{
+            if (is_array($value) == false) {{
                 $value = null;
                 break;
             }}
             if ($is_index) {{
                 $idx = intval($segment);
-                if (!array_key_exists($idx, $value)) {{
+                if (array_key_exists($idx, $value) == false) {{
                     $value = null;
                     break;
                 }}
                 $value = $value[$idx];
             }} else {{
-                if (!array_key_exists($segment, $value)) {{
+                if (array_key_exists($segment, $value) == false) {{
                     $value = null;
                     break;
                 }}
@@ -83,13 +83,13 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         @require_once('/etc/inc/services.inc');
 
         function normalize_staticmap_entry($entry) {{
-            if (!is_array($entry)) {{
+            if (is_array($entry) == false) {{
                 return null;
             }}
             $fields = array('mac','cid','ipaddr','hostname','descr');
             $normalized = array();
             foreach ($fields as $field) {{
-                if (!array_key_exists($field, $entry)) {{
+                if (array_key_exists($field, $entry) == false) {{
                     continue;
                 }}
                 $value = $entry[$field];
@@ -104,10 +104,10 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
                 }}
                 $normalized[$field] = $value;
             }}
-            if (!isset($normalized['ipaddr'])) {{
+            if (isset($normalized['ipaddr']) == false) {{
                 return null;
             }}
-            if (!isset($normalized['mac']) && !isset($normalized['cid'])) {{
+            if (isset($normalized['mac']) == false && isset($normalized['cid']) == false) {{
                 return null;
             }}
             return $normalized;
@@ -115,7 +115,7 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
 
         function normalize_staticmap_entries($entries) {{
             $result = array();
-            if (!is_array($entries)) {{
+            if (is_array($entries) == false) {{
                 return $result;
             }}
             foreach ($entries as $entry) {{
@@ -136,11 +136,15 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
 
         $payload_raw = base64_decode('{payload_b64}');
         $payload = json_decode($payload_raw, true);
-        if (!is_array($payload) || !isset($payload['ifaces']) || !is_array($payload['ifaces'])) {{
+        if (
+            is_array($payload) == false ||
+            isset($payload['ifaces']) == false ||
+            is_array($payload['ifaces']) == false
+        ) {{
             echo base64_encode(json_encode(['ok'=>false,'error'=>'payload inválido']));
             exit(1);
         }}
-        if (!isset($config['dhcpd']) || !is_array($config['dhcpd'])) {{
+        if (isset($config['dhcpd']) == false || is_array($config['dhcpd']) == false) {{
             $config['dhcpd'] = array();
         }}
         $changed_ifaces = array();
@@ -153,8 +157,11 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
             if (isset($data['reservations'])) {{
                 $entries = normalize_staticmap_entries($data['reservations']);
             }}
-            $delete = !empty($data['delete']);
-            if (!isset($config['dhcpd'][$iface]) || !is_array($config['dhcpd'][$iface])) {{
+            $delete = empty($data['delete']) == false;
+            if (
+                isset($config['dhcpd'][$iface]) == false ||
+                is_array($config['dhcpd'][$iface]) == false
+            ) {{
                 $config['dhcpd'][$iface] = array();
             }}
             $current = array();
@@ -162,7 +169,7 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
                 $current = array_values($config['dhcpd'][$iface]['staticmap']);
             }}
             if ($delete && empty($entries)) {{
-                if (!empty($current)) {{
+                if (empty($current) == false) {{
                     unset($config['dhcpd'][$iface]['staticmap']);
                     $changed_ifaces[] = $iface;
                 }}
@@ -171,7 +178,7 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
             if (empty($entries)) {{
                 continue;
             }}
-            if (!empty($current) && staticmaps_equal($current, $entries)) {{
+            if (empty($current) == false && staticmaps_equal($current, $entries)) {{
                 continue;
             }}
             $config['dhcpd'][$iface]['staticmap'] = $entries;
@@ -185,10 +192,16 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         if ($note === false) {{
             $note = 'Atualizado via pfsense_kea_ipam_sync.py';
         }}
-        if (!isset($config['notifications']) || !is_array($config['notifications'])) {{
+        if (
+            isset($config['notifications']) == false ||
+            is_array($config['notifications']) == false
+        ) {{
             $config['notifications'] = array();
         }}
-        if (!isset($config['notifications']['smtp']) || !is_array($config['notifications']['smtp'])) {{
+        if (
+            isset($config['notifications']['smtp']) == false ||
+            is_array($config['notifications']['smtp']) == false
+        ) {{
             $config['notifications']['smtp'] = array();
         }}
         write_config($note);
