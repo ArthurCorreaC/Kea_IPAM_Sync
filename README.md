@@ -121,10 +121,13 @@ PF_SSH_REMOVE_LOCAL_COPY=false
 RELOAD_AFTER_DB=true
 
 # --- pfSense ($config) ---
-PF_CONFIG_PATH=installedpackages:kea_dhcp4:config:0:Dhcp4
+# As reservas são gravadas diretamente em $config['dhcpd'][iface]['staticmap']
+# (qualquer caminho diferente será ignorado)
+PF_CONFIG_PATH=dhcpd
 PF_CONFIG_WRITE_NOTE=Atualizado via Kea_IPAM_Sync
 
 # --- Mapeamentos de subnet-id ---
+# (as chaves definem as sub-redes buscadas; no modo pfSense a interface é descoberta automaticamente)
 SUBNET_ID_MAP_JSON={"39":188}
 
 # --- (Opcional) Control Agent ---
@@ -173,7 +176,11 @@ Quando `PF_SSH_PASSWORD` estiver definido, o script usa `sshpass` (se disponíve
 O `pfsense_kea_ipam_sync.py` reutiliza exatamente essas mesmas variáveis para executar comandos PHP diretamente no firewall. Caso nenhum `PF_SSH_HOST` seja informado, o script supõe que está rodando dentro do próprio pfSense (onde o binário `php` já está presente).
 
 #### Escolhendo o nó no `$config`
-Defina `PF_CONFIG_PATH` para apontar o caminho até a estrutura que representa o `Dhcp4` (por exemplo `installedpackages:kea_dhcp4:config:0:Dhcp4`). Use dois pontos (`:`) para separar cada nível do array `$config`. O script lê esse nó antes de aplicar qualquer alteração, compara com o que veio do phpIPAM e só executa `write_config()` + `services_kea_*_configure()` quando detectar um `update`. Se nada mudar, apenas um log é emitido e o reload é pulado.
+O modo pfSense trabalha exclusivamente com `$config['dhcpd']`. Mesmo que `PF_CONFIG_PATH` seja definido com outro caminho (por exemplo, o antigo `installedpackages:kea_dhcp4:...`), o script irá ignorar o valor e usar `dhcpd` automaticamente. Isso evita que as reservas sejam gravadas em árvores que não são consumidas pelo serviço DHCP nativo. Se você migrou de uma versão anterior, basta remover o valor antigo do `.env` ou deixá-lo como `dhcpd`.
+
+Durante a sincronização o script envia ao pfSense apenas as listas de static-maps por interface. Um trecho em PHP (executado localmente ou via SSH) garante que `$config['dhcpd'][$iface]['staticmap']` exista, substitui o conteúdo somente quando há diferenças e, aí sim, chama `write_config()` + `services_dhcpd_configure()`. Caso não haja nenhuma mudança, o pfSense permanece intacto e o reload é pulado.
+
+O `pfsense_kea_ipam_sync.py` também aproveita as chaves configuradas em `SUBNET_ID_MAP_JSON` (ou equivalentes) para buscar as sub-redes no phpIPAM e cruza cada IP com os dados de `$config['interfaces']`. Dessa forma ele descobre automaticamente qual interface DHCP deve receber as reservas, eliminando a necessidade de mapear `lan`, `vlanX` etc. manualmente.
 
 ---
 

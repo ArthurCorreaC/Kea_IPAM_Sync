@@ -785,6 +785,23 @@ def ipam_get_addresses(
     return (0, rows)
 
 
+def ipam_get_subnet(
+    base: str,
+    token: str,
+    subnet_id: str,
+    verify_tls: bool,
+) -> Tuple[int, Optional[Dict[str, Any]]]:
+    url = f"{base}/api/{env_first('PHPIPAM_APP_ID', 'IPAM_APP_ID', default='kea')}/subnets/{subnet_id}/"
+    rc, data = ipam_request("GET", url, token=token, verify_tls=verify_tls)
+    if rc != 0 or not data:
+        return (1, None)
+    subnet = data.get("data")
+    if not isinstance(subnet, dict):
+        _err(f"phpIPAM retornou dados inesperados ao consultar a sub-rede {subnet_id}")
+        return (1, None)
+    return (0, subnet)
+
+
 def pick_first(row: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
     for key in keys:
         if key in row:
