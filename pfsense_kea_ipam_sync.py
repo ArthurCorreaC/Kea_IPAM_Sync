@@ -475,6 +475,135 @@ def _build_staticmap_entry(item: Dict[str, Any]) -> Dict[str, Any]:
     return entry
 
 
+def _normalize_staticmap_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(entry, dict):
+        return None
+    normalized: Dict[str, Any] = {}
+    for field in ("ipaddr", "mac", "cid", "hostname", "descr"):
+        if field not in entry:
+            continue
+        value = entry[field]
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+        if value == "":
+            continue
+        if field in ("mac", "cid") and isinstance(value, str):
+            value = value.lower()
+        normalized[field] = value
+    if "ipaddr" not in normalized:
+        return None
+    if "mac" not in normalized and "cid" not in normalized:
+        return None
+    return normalized
+
+
+def _normalize_staticmap_entries(entries: Any) -> List[Dict[str, Any]]:
+    if isinstance(entries, dict):
+        iterable = entries.values()
+    elif isinstance(entries, list):
+        iterable = entries
+    else:
+        return []
+    result: List[Dict[str, Any]] = []
+    for entry in iterable:
+        normalized = _normalize_staticmap_entry(entry)
+        if normalized is None:
+            continue
+        result.append(normalized)
+    return result
+
+
+def _staticmap_entries_by_ip(entries: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    mapping: Dict[str, Dict[str, Any]] = {}
+    for entry in entries:
+        ipaddr = str(entry.get("ipaddr"))
+        if not ipaddr:
+            continue
+        if ipaddr in mapping:
+            jk._warn(f"Mais de uma reserva para o IP {ipaddr}; mantendo a última entrada")
+        mapping[ipaddr] = entry
+    return mapping
+
+
+def _staticmap_entries_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    fields = ("mac", "cid", "hostname", "descr")
+    for field in fields:
+        if a.get(field) != b.get(field):
+            return False
+    return True
+
+
+def _diff_staticmaps(
+    current_entries: List[Dict[str, Any]],
+    desired_entries: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]]]:
+    current_by_ip = _staticmap_entries_by_ip(current_entries)
+    desired_by_ip = _staticmap_entries_by_ip(desired_entries)
+
+    created: List[Dict[str, Any]] = []
+    updated: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    deleted: List[Dict[str, Any]] = []
+
+    for ip, desired_entry in desired_by_ip.items():
+        current_entry = current_by_ip.get(ip)
+        if current_entry is None:
+            created.append(desired_entry)
+            continue
+        if not _staticmap_entries_equal(current_entry, desired_entry):
+            updated.append((current_entry, desired_entry))
+
+    for ip, current_entry in current_by_ip.items():
+        if ip not in desired_by_ip:
+            deleted.append(current_entry)
+
+    return created, updated, deleted
+
+
+def _describe_staticmap_entry(entry: Dict[str, Any]) -> str:
+    parts = [str(entry.get("ipaddr"))]
+    identifier = entry.get("mac") or entry.get("cid")
+    if identifier:
+        parts.append(str(identifier))
+    hostname = entry.get("hostname")
+    if hostname:
+        parts.append(str(hostname))
+    descr = entry.get("descr")
+    if descr and descr != hostname:
+        parts.append(f"descr='{descr}'")
+    return " ".join(parts)
+
+
+def _describe_staticmap_change(old: Dict[str, Any], new: Dict[str, Any]) -> str:
+    changes: List[str] = []
+    for field in ("mac", "cid", "hostname", "descr"):
+        old_val = old.get(field)
+        new_val = new.get(field)
+        if old_val == new_val:
+            continue
+        changes.append(
+            f"{field}: '{old_val if old_val is not None else '-'}' -> '{new_val if new_val is not None else '-'}'"
+        )
+    if not changes:
+        return "sem alterações de campo"
+    return ", ".join(changes)
+
+
+def _extract_current_staticmaps(
+    dhcpd_config: Optional[Dict[str, Any]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    if not isinstance(dhcpd_config, dict):
+        return result
+    for iface, data in dhcpd_config.items():
+        if not isinstance(data, dict):
+            continue
+        entries = _normalize_staticmap_entries(data.get("staticmap"))
+        result[str(iface)] = entries
+    return result
+
+
 def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, int]:
     base = jk.build_ipam_base_url()
     if not base:
@@ -518,6 +647,13 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
     if interfaces_config is None:
         jk._err("Não foi possível ler $config['interfaces'] no pfSense; necessário para localizar as redes de cada interface.")
         return (0, 0, 1)
+
+    dhcpd_config = fetch_pfsense_config(["dhcpd"], ssh_settings)
+    if dhcpd_config is None:
+        jk._warn(
+            "Não foi possível ler $config['dhcpd'] no pfSense; assumindo que não há reservas atuais para comparação"
+        )
+    current_staticmaps = _extract_current_staticmaps(dhcpd_config)
 
     iface_networks = _build_iface_network_index(interfaces_config)
     if not iface_networks:
@@ -628,11 +764,49 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
     updates_payload: Dict[str, Dict[str, Any]] = {}
     total_reservations = 0
     for iface, result in iface_results.items():
-        reservations = result.get("reservations") or []
+        reservations_raw = result.get("reservations") or []
+        reservations = _normalize_staticmap_entries(reservations_raw)
         delete_flag = bool(result.get("delete"))
-        if not reservations and not delete_flag:
+        current_entries = current_staticmaps.get(iface, [])
+
+        if delete_flag and not reservations:
+            if not current_entries:
+                jk._info(
+                    f"Interface {iface} já não possui static-maps — nenhuma remoção necessária"
+                )
+                continue
+            for entry in current_entries:
+                jk._info(
+                    f"Reserva removida interface={iface} {_describe_staticmap_entry(entry)}"
+                )
+            updates_payload[iface] = {"reservations": [], "delete": True}
             continue
-        updates_payload[iface] = {"reservations": reservations, "delete": delete_flag}
+
+        if not reservations:
+            continue
+
+        created, updated, deleted = _diff_staticmaps(current_entries, reservations)
+        if not created and not updated and not deleted:
+            jk._debug(
+                f"Interface {iface} já possui reservas idênticas — nenhuma atualização necessária"
+            )
+            continue
+
+        for entry in created:
+            jk._info(
+                f"Reserva adicionada interface={iface} {_describe_staticmap_entry(entry)}"
+            )
+        for old, new in updated:
+            change = _describe_staticmap_change(old, new)
+            jk._info(
+                f"Reserva atualizada interface={iface} {new['ipaddr']} ({change})"
+            )
+        for entry in deleted:
+            jk._info(
+                f"Reserva removida interface={iface} {_describe_staticmap_entry(entry)}"
+            )
+
+        updates_payload[iface] = {"reservations": reservations, "delete": False}
         total_reservations += len(reservations)
 
     if not updates_payload:
