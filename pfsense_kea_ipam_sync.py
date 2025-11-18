@@ -73,90 +73,118 @@ def _php_reader_code(path_b64: str) -> str:
     )
 
 
-def _php_writer_code(path_b64: str, payload_b64: str, note_b64: str) -> str:
+def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
     return _compact_php(
         f"""
         @ini_set('display_errors','0');
         require_once('/etc/inc/config.inc');
+        @require_once('/etc/inc/util.inc');
+        @require_once('/etc/inc/functions.inc');
         @require_once('/etc/inc/services.inc');
-        $segments = json_decode(base64_decode('{path_b64}'), true);
-        if (!is_array($segments) || empty($segments)) {{
-            echo base64_encode(json_encode(['ok'=>false,'error'=>'config path vazio']));
-            exit(1);
+
+        function normalize_staticmap_entry($entry) {{
+            if (!is_array($entry)) {{
+                return null;
+            }}
+            $fields = array('mac','cid','ipaddr','hostname','descr');
+            $normalized = array();
+            foreach ($fields as $field) {{
+                if (!array_key_exists($field, $entry)) {{
+                    continue;
+                }}
+                $value = $entry[$field];
+                if ($value === null || $value === '') {{
+                    continue;
+                }}
+                if (is_string($value)) {{
+                    $value = trim($value);
+                }}
+                if ($field === 'mac' || $field === 'cid') {{
+                    $value = strtolower($value);
+                }}
+                $normalized[$field] = $value;
+            }}
+            if (!isset($normalized['ipaddr'])) {{
+                return null;
+            }}
+            if (!isset($normalized['mac']) && !isset($normalized['cid'])) {{
+                return null;
+            }}
+            return $normalized;
         }}
-        $data_raw = base64_decode('{payload_b64}');
-        $data = json_decode($data_raw, true);
-        if ($data === null && json_last_error() !== JSON_ERROR_NONE) {{
+
+        function normalize_staticmap_entries($entries) {{
+            $result = array();
+            if (!is_array($entries)) {{
+                return $result;
+            }}
+            foreach ($entries as $entry) {{
+                $normalized = normalize_staticmap_entry($entry);
+                if ($normalized === null) {{
+                    continue;
+                }}
+                $result[] = $normalized;
+            }}
+            return $result;
+        }}
+
+        function staticmaps_equal($current, $next) {{
+            $current_v = array_values($current);
+            $next_v = array_values($next);
+            return serialize($current_v) === serialize($next_v);
+        }}
+
+        $payload_raw = base64_decode('{payload_b64}');
+        $payload = json_decode($payload_raw, true);
+        if (!is_array($payload) || !isset($payload['ifaces']) || !is_array($payload['ifaces'])) {{
             echo base64_encode(json_encode(['ok'=>false,'error'=>'payload inválido']));
             exit(1);
         }}
-        $value = $config;
-        foreach ($segments as $segment) {{
-            $segment = (string)$segment;
-            $is_index = ctype_digit($segment);
-            if (!is_array($value)) {{
-                $value = null;
-                break;
-            }}
-            if ($is_index) {{
-                $idx = intval($segment);
-                if (!array_key_exists($idx, $value)) {{
-                    $value = null;
-                    break;
-                }}
-                $value = $value[$idx];
-            }} else {{
-                if (!array_key_exists($segment, $value)) {{
-                    $value = null;
-                    break;
-                }}
-                $value = $value[$segment];
-            }}
+        if (!isset($config['dhcpd']) || !is_array($config['dhcpd'])) {{
+            $config['dhcpd'] = array();
         }}
-        $current_serial = serialize($value);
-        $new_serial = serialize($data);
-        if ($current_serial === $new_serial) {{
+        $changed_ifaces = array();
+        foreach ($payload['ifaces'] as $iface => $data) {{
+            $iface = (string)$iface;
+            if ($iface === '') {{
+                continue;
+            }}
+            $entries = array();
+            if (isset($data['reservations'])) {{
+                $entries = normalize_staticmap_entries($data['reservations']);
+            }}
+            $delete = !empty($data['delete']);
+            if (!isset($config['dhcpd'][$iface]) || !is_array($config['dhcpd'][$iface])) {{
+                $config['dhcpd'][$iface] = array();
+            }}
+            $current = array();
+            if (isset($config['dhcpd'][$iface]['staticmap']) && is_array($config['dhcpd'][$iface]['staticmap'])) {{
+                $current = array_values($config['dhcpd'][$iface]['staticmap']);
+            }}
+            if ($delete && empty($entries)) {{
+                if (!empty($current)) {{
+                    unset($config['dhcpd'][$iface]['staticmap']);
+                    $changed_ifaces[] = $iface;
+                }}
+                continue;
+            }}
+            if (empty($entries)) {{
+                continue;
+            }}
+            if (!empty($current) && staticmaps_equal($current, $entries)) {{
+                continue;
+            }}
+            $config['dhcpd'][$iface]['staticmap'] = $entries;
+            $changed_ifaces[] = $iface;
+        }}
+        if (empty($changed_ifaces)) {{
             echo base64_encode(json_encode(['ok'=>true,'changed'=>false]));
             exit(0);
-        }}
-        $ref =& $config;
-        $lastIndex = count($segments) - 1;
-        foreach ($segments as $idx => $segment) {{
-            $segment = (string)$segment;
-            $is_last = ($idx === $lastIndex);
-            $is_index = ctype_digit($segment);
-            if ($is_last) {{
-                if (!is_array($ref)) {{
-                    $ref = array();
-                }}
-                if ($is_index) {{
-                    $ref[intval($segment)] = $data;
-                }} else {{
-                    $ref[$segment] = $data;
-                }}
-                break;
-            }}
-            if (!is_array($ref)) {{
-                $ref = array();
-            }}
-            if ($is_index) {{
-                $index = intval($segment);
-                if (!array_key_exists($index, $ref) || !is_array($ref[$index])) {{
-                    $ref[$index] = array();
-                }}
-                $ref =& $ref[$index];
-            }} else {{
-                if (!array_key_exists($segment, $ref) || !is_array($ref[$segment])) {{
-                    $ref[$segment] = array();
-                }}
-                $ref =& $ref[$segment];
-            }}
         }}
         $note = base64_decode('{note_b64}');
         if ($note === false) {{
             $note = 'Atualizado via pfsense_kea_ipam_sync.py';
         }}
-        // Evita TypeError no array_path_enabled() quando notificações não existem
         if (!isset($config['notifications']) || !is_array($config['notifications'])) {{
             $config['notifications'] = array();
         }}
@@ -164,8 +192,6 @@ def _php_writer_code(path_b64: str, payload_b64: str, note_b64: str) -> str:
             $config['notifications']['smtp'] = array();
         }}
         write_config($note);
-
-        // Reload do serviço DHCP nativo
         if (function_exists('services_dhcpd_configure')) {{
             services_dhcpd_configure();
         }} elseif (function_exists('dhcpd_configure')) {{
@@ -173,8 +199,7 @@ def _php_writer_code(path_b64: str, payload_b64: str, note_b64: str) -> str:
         }} elseif (file_exists('/usr/local/sbin/rc.dhcpd')) {{
             mwexec('/usr/local/sbin/rc.dhcpd restart');
         }}
-
-        echo base64_encode(json_encode(['ok'=>true,'changed'=>true]));
+        echo base64_encode(json_encode(['ok'=>true,'changed'=>true,'ifaces'=>$changed_ifaces]));
         """
     )
 
@@ -242,29 +267,37 @@ def fetch_pfsense_config(
     return None
 
 
-def push_pfsense_config(
-    config: Dict[str, Any],
-    path_segments: List[str],
+def push_staticmaps_to_pfsense(
+    staticmaps_by_iface: Dict[str, Dict[str, Any]],
     ssh_settings: Optional[Dict[str, Any]],
     note: str,
-) -> Tuple[bool, bool]:
-    payload_b64 = _encode_b64_json(config)
-    path_b64 = _encode_b64_json(path_segments)
+) -> Tuple[bool, bool, List[str]]:
+    if not staticmaps_by_iface:
+        return True, False, []
+    payload = {"ifaces": staticmaps_by_iface}
+    payload_b64 = _encode_b64_json(payload)
     note_b64 = _encode_b64_text(note)
-    code = _php_writer_code(path_b64, payload_b64, note_b64)
+    code = _php_apply_staticmaps_code(payload_b64, note_b64)
     rc, stdout, stderr = _run_php(code, ssh_settings)
     if rc != 0:
         message = stderr or stdout or f"php retornou código {rc}"
         jk._err(f"Falha ao atualizar o pfSense: {message}")
-        return False, False
+        return False, False, []
     response = _decode_base64_json(stdout)
     if not response:
-        return True, True
+        return True, True, list(staticmaps_by_iface.keys())
     if not response.get("ok", True):
         error_msg = response.get("error") or "erro desconhecido"
         jk._err(f"pfSense rejeitou atualização: {error_msg}")
-        return False, False
-    return True, bool(response.get("changed", False))
+        return False, False, []
+    changed_ifaces = []
+    if response.get("changed"):
+        payload_ifaces = response.get("ifaces")
+        if isinstance(payload_ifaces, list):
+            changed_ifaces = [str(iface) for iface in payload_ifaces]
+        else:
+            changed_ifaces = list(staticmaps_by_iface.keys())
+    return True, bool(response.get("changed", False)), changed_ifaces
 
 
 def get_config_path_segments() -> List[str]:
@@ -442,38 +475,6 @@ def _build_staticmap_entry(item: Dict[str, Any]) -> Dict[str, Any]:
     return entry
 
 
-def _apply_staticmaps(
-    dhcpd_config: Dict[str, Any],
-    staticmaps_by_iface: Dict[str, List[Dict[str, Any]]],
-    delete_missing: bool,
-) -> Tuple[int, int]:
-    interfaces_modified = 0
-    total_mappings = 0
-
-    for iface, entries in staticmaps_by_iface.items():
-        iface_section = dhcpd_config.get(iface)
-        if not isinstance(iface_section, dict):
-            iface_section = {}
-            dhcpd_config[iface] = iface_section
-        current = iface_section.get("staticmap")
-        if not isinstance(current, list):
-            current = []
-        if entries or delete_missing:
-            if current != entries:
-                iface_section["staticmap"] = entries
-                interfaces_modified += 1
-                jk._info(
-                    f"Atualizadas {len(entries)} reservas para interface={iface}"
-                )
-        else:
-            jk._debug(
-                f"Interface {iface} não recebeu reservas e --skip-delete está ativo; mantendo static-maps atuais"
-            )
-        total_mappings += len(entries)
-
-    return total_mappings, interfaces_modified
-
-
 def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, int]:
     base = jk.build_ipam_base_url()
     if not base:
@@ -510,13 +511,9 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
         return (0, 0, 1)
 
     ssh_settings = jk._load_ssh_settings()
-    path_segments = get_config_path_segments()
+    # Ainda validamos PF_CONFIG_PATH para alertar sobre caminhos inválidos
+    get_config_path_segments()
     errors = 0
-    remote_config = fetch_pfsense_config(path_segments, ssh_settings)
-    if remote_config is None:
-        jk._err("Não foi possível ler a configuração DHCP atual do pfSense; abortando para evitar sobrescrita.")
-        return (0, 0, 1)
-
     interfaces_config = fetch_pfsense_config(["interfaces"], ssh_settings)
     if interfaces_config is None:
         jk._err("Não foi possível ler $config['interfaces'] no pfSense; necessário para localizar as redes de cada interface.")
@@ -526,8 +523,6 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
     if not iface_networks:
         jk._err("Nenhuma interface com IPv4 válido encontrada no pfSense; habilite DHCP nas VLANs desejadas antes de sincronizar.")
         return (0, 0, 1)
-
-    config = remote_config
 
     iface_results: Dict[str, Dict[str, Any]] = {}
     processed_ifaces: Set[str] = set()
@@ -630,40 +625,61 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
         jk._warn("Nenhuma interface foi processada com sucesso; nada para escrever.")
         return (0, 0, errors if errors else 1)
 
-    staticmaps_by_iface: Dict[str, List[Dict[str, Any]]] = {}
+    updates_payload: Dict[str, Dict[str, Any]] = {}
+    total_reservations = 0
     for iface, result in iface_results.items():
         reservations = result.get("reservations") or []
-        if reservations:
-            staticmaps_by_iface[iface] = reservations
-        elif delete_missing and result.get("delete"):
-            staticmaps_by_iface[iface] = []
+        delete_flag = bool(result.get("delete"))
+        if not reservations and not delete_flag:
+            continue
+        updates_payload[iface] = {"reservations": reservations, "delete": delete_flag}
+        total_reservations += len(reservations)
 
-    total_reservations, interfaces_modified = _apply_staticmaps(
-        config, staticmaps_by_iface, delete_missing
-    )
+    if not updates_payload:
+        if errors:
+            return (total_reservations, 0, errors)
+        jk._info("Nenhuma alteração necessária — pfSense já estava sincronizado")
+        return (total_reservations, 0, errors)
 
     if dry_run:
-        jk._info(
-            f"DRY-RUN: {total_reservations} reservas seriam gravadas em {interfaces_modified} interfaces"
-        )
-        return (total_reservations, interfaces_modified, errors)
+        for iface, data in updates_payload.items():
+            count = len(data.get("reservations") or [])
+            if count:
+                jk._info(
+                    f"DRY-RUN: {count} reservas seriam gravadas na interface={iface}"
+                )
+            elif data.get("delete"):
+                jk._info(
+                    f"DRY-RUN: static-maps seriam removidos da interface={iface}"
+                )
+        return (total_reservations, len(updates_payload), errors)
 
-    if interfaces_modified <= 0:
-        jk._info("Nenhuma alteração detectada — pfSense já estava sincronizado")
-        return (total_reservations, interfaces_modified, errors)
-
-    note = jk.env_first("PF_CONFIG_WRITE_NOTE", "PFSENSE_CONFIG_NOTE", default="Kea_IPAM_Sync") or "Kea_IPAM_Sync"
-    success, changed = push_pfsense_config(config, path_segments, ssh_settings, note)
+    note = (
+        jk.env_first("PF_CONFIG_WRITE_NOTE", "PFSENSE_CONFIG_NOTE", default="Kea_IPAM_Sync")
+        or "Kea_IPAM_Sync"
+    )
+    success, changed, changed_ifaces = push_staticmaps_to_pfsense(
+        updates_payload, ssh_settings, note
+    )
     if not success:
         errors += 1
-        return (total_reservations, interfaces_modified, errors)
+        return (total_reservations, 0, errors)
 
-    if changed:
-        jk._info("Configuração do pfSense atualizada e serviço recarregado")
-    else:
+    if not changed:
         jk._info("pfSense já possuía a mesma configuração — sem reload adicional")
+        return (total_reservations, 0, errors)
 
-    return (total_reservations, interfaces_modified, errors)
+    for iface in changed_ifaces:
+        data = updates_payload.get(iface, {})
+        count = len(data.get("reservations") or [])
+        if count:
+            jk._info(f"Atualizadas {count} reservas para interface={iface}")
+        elif data.get("delete"):
+            jk._info(f"Static-maps removidos para interface={iface}")
+
+    jk._info("Configuração do pfSense atualizada e serviço recarregado")
+
+    return (total_reservations, len(changed_ifaces), errors)
 
 
 def main() -> int:
