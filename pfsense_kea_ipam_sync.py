@@ -8,14 +8,768 @@ import argparse
 import base64
 import ipaddress
 import json
+import logging
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 import unicodedata
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import json_kea_ipam_sync as jk
+import requests
+import types
+
+try:  # pragma: no cover - dependência opcional
+    import paramiko  # type: ignore
+except Exception:  # pragma: no cover - fallback silencioso
+    paramiko = None  # type: ignore
+
+
+jk = types.SimpleNamespace()
+
+
+# ---------------------------
+# Logging helpers (copiados do json_kea_ipam_sync.py)
+# ---------------------------
+LOG_NAME = "json_kea_ipam_sync"
+LOG_DIR_ENV_VAR = "KEA_IPAM_SYNC_LOG_DIR"
+LOG_RETENTION_ENV_VAR = "KEA_IPAM_SYNC_LOG_RETENTION_DAYS"
+DEFAULT_LOG_DIR = "logs"
+DEFAULT_LOG_RETENTION_DAYS = 5
+
+_LOGGER = logging.getLogger(LOG_NAME)
+_LOGGER.setLevel(logging.DEBUG)
+_LOGGER.propagate = False
+_LOGGER_INITIALIZED = False
+_CURRENT_LOG_DIR: Optional[str] = None
+_CURRENT_RETENTION_DAYS = DEFAULT_LOG_RETENTION_DAYS
+_DEBUG_ENV_NAMES = (
+    "DEBUG",
+    "KEA_IPAM_SYNC_DEBUG",
+    "PFSENSE_IPAM_SYNC_DEBUG",
+)
+_DEBUG_ONE_BY_ONE_ENV_NAMES = (
+    "DEBUG_ONE_A_ONE",
+    "DEBUG_ONE_BY_ONE",
+    "PFSENSE_DEBUG_ONE_A_ONE",
+    "PFSENSE_DEBUG_ONE_BY_ONE",
+    "KEA_IPAM_SYNC_DEBUG_ONE_A_ONE",
+)
+_DEBUG_TRUE_VALUES = {"1", "true", "yes", "y", "sim", "on"}
+_DEBUG_FALSE_VALUES = {"0", "false", "no", "n", "nao", "off"}
+
+
+def _cleanup_old_logs(log_dir: str, keep_days: int) -> None:
+    if keep_days <= 0 or not log_dir:
+        return
+    cutoff = time.time() - (keep_days * 86400)
+    try:
+        entries = os.listdir(log_dir)
+    except OSError:
+        return
+    for name in entries:
+        if not name.startswith("json_kea_ipam_sync_") or not name.endswith(".log"):
+            continue
+        path = os.path.join(log_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def setup_logging(force: bool = False) -> None:
+    global _LOGGER_INITIALIZED, _CURRENT_LOG_DIR, _CURRENT_RETENTION_DAYS
+
+    log_dir = os.getenv(LOG_DIR_ENV_VAR, DEFAULT_LOG_DIR).strip() or DEFAULT_LOG_DIR
+    retention_raw = os.getenv(LOG_RETENTION_ENV_VAR, "").strip()
+    try:
+        retention_days = int(retention_raw) if retention_raw else DEFAULT_LOG_RETENTION_DAYS
+    except ValueError:
+        retention_days = DEFAULT_LOG_RETENTION_DAYS
+    if retention_days < 0:
+        retention_days = DEFAULT_LOG_RETENTION_DAYS
+
+    if _LOGGER_INITIALIZED and not force:
+        return
+    if (
+        _LOGGER_INITIALIZED
+        and force
+        and log_dir == (_CURRENT_LOG_DIR or "")
+        and retention_days == _CURRENT_RETENTION_DAYS
+    ):
+        return
+
+    prepared_log_dir = log_dir
+    if prepared_log_dir:
+        try:
+            os.makedirs(prepared_log_dir, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"[WARN] Não foi possível criar diretório de logs '{prepared_log_dir}': {exc}",
+                file=sys.stderr,
+            )
+            prepared_log_dir = ""
+
+    if prepared_log_dir:
+        _cleanup_old_logs(prepared_log_dir, retention_days)
+
+    for handler in list(_LOGGER.handlers):
+        _LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    file_handler: Optional[logging.Handler] = None
+    if prepared_log_dir:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(prepared_log_dir, f"json_kea_ipam_sync_{timestamp}.log")
+        try:
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        except OSError as exc:
+            print(
+                f"[WARN] Não foi possível criar arquivo de log '{log_file}': {exc}",
+                file=sys.stderr,
+            )
+            file_handler = None
+
+    if file_handler:
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+        )
+        _LOGGER.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler(stream=sys.stdout)
+    stream_handler.setLevel(logging.DEBUG)
+    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    _LOGGER.addHandler(stream_handler)
+
+    _LOGGER_INITIALIZED = True
+    _CURRENT_LOG_DIR = prepared_log_dir
+    _CURRENT_RETENTION_DAYS = retention_days
+
+
+def _ensure_logger() -> logging.Logger:
+    if not _LOGGER_INITIALIZED:
+        setup_logging()
+    return _LOGGER
+
+
+def _is_debug_enabled() -> bool:
+    for name in _DEBUG_ENV_NAMES:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        s = str(value).strip().lower()
+        if s in _DEBUG_TRUE_VALUES:
+            return True
+        if s in _DEBUG_FALSE_VALUES:
+            return False
+    return False
+
+
+def _log(level: int, message: str) -> None:
+    logger = _ensure_logger()
+    logger.log(level, message)
+
+
+def _debug(msg: str) -> None:
+    if _is_debug_enabled():
+        _log(logging.DEBUG, f"[DEBUG] {msg}")
+
+
+def _warn(msg: str) -> None:
+    _log(logging.WARNING, f"[WARN] {msg}")
+
+
+def _err(msg: str) -> None:
+    _log(logging.ERROR, f"ERRO {msg}")
+
+
+def _info(msg: str) -> None:
+    _log(logging.INFO, f"OK {msg}")
+
+
+def is_debug_enabled() -> bool:
+    return _is_debug_enabled()
+
+
+def is_debug_one_by_one_enabled() -> bool:
+    for name in _DEBUG_ONE_BY_ONE_ENV_NAMES:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        s = str(value).strip().lower()
+        if s in _DEBUG_TRUE_VALUES:
+            return True
+        if s in _DEBUG_FALSE_VALUES:
+            return False
+    return False
+
+
+# ---------------------------
+# .env loader (leve, sem python-dotenv)
+# ---------------------------
+def load_env(path: str) -> None:
+    if not os.path.isfile(path):
+        _warn(f".env não encontrado em {path} (seguindo com variáveis de ambiente já carregadas)")
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            v = v.strip().strip("'").strip('"')
+            os.environ.setdefault(k.strip(), v)
+
+
+# ---------------------------
+# Utilidades
+# ---------------------------
+DEFAULT_TRUE_VALUES: Set[str] = {"1", "true", "yes", "y", "sim", "on"}
+DEFAULT_FALSE_VALUES: Set[str] = {"0", "false", "no", "n", "nao", "off"}
+DEFAULT_CUSTOM_FIELDS: Tuple[str, ...] = (
+    "custom_kea_reserve",
+    "kea_reserve",
+    "custom_reserva_kea",
+    "reserva_kea",
+)
+
+
+def env_first(*names: str, default: Optional[str] = None) -> Optional[str]:
+    for name in names:
+        if not name:
+            continue
+        value = os.getenv(name)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+        return str(value)
+    return default
+
+
+def parse_bool(
+    value: Any,
+    default: bool = False,
+    true_values: Optional[Set[str]] = None,
+    false_values: Optional[Set[str]] = None,
+) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if not s:
+        return default
+    tv = true_values or DEFAULT_TRUE_VALUES
+    fv = false_values or DEFAULT_FALSE_VALUES
+    if s in tv:
+        return True
+    if s in fv:
+        return False
+    return default
+
+
+def csv_to_list(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def get_custom_field_names() -> List[str]:
+    names: List[str] = []
+    raw = os.getenv("CUSTOM_FIELD_NAME", "")
+    for part in csv_to_list(raw):
+        if part not in names:
+            names.append(part)
+    for fallback in DEFAULT_CUSTOM_FIELDS:
+        if fallback not in names:
+            names.append(fallback)
+    return names
+
+
+def get_custom_true_values() -> Set[str]:
+    raw = os.getenv("CUSTOM_FIELD_TRUE_VALUES")
+    if raw:
+        values = {item.lower() for item in csv_to_list(raw)}
+        if values:
+            return values
+    return set(DEFAULT_TRUE_VALUES)
+
+
+HEX_DIGITS = set("0123456789abcdef")
+
+
+def _clean_hex_string(value: str) -> str:
+    return "".join(ch for ch in value if ch.lower() in HEX_DIGITS)
+
+
+def normalize_mac(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = _clean_hex_string(str(value))
+    if len(cleaned) != 12:
+        return None
+    return cleaned.lower()
+
+
+def normalize_client_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = _clean_hex_string(str(value))
+    if len(cleaned) < 2 or len(cleaned) % 2 != 0:
+        return None
+    if len(cleaned) > 64:
+        return None
+    return cleaned.lower()
+
+
+def _group_hex_pairs(value: str) -> str:
+    return ":".join(value[i : i + 2] for i in range(0, len(value), 2))
+
+
+# ---------------------------
+# phpIPAM helpers
+# ---------------------------
+def build_ipam_base_url() -> Optional[str]:
+    base = env_first("PHPIPAM_BASE_URL", "IPAM_BASE_URL")
+    if not base:
+        return None
+    base = base.rstrip("/")
+    return base
+
+
+def ipam_request(
+    method: str,
+    url: str,
+    token: Optional[str],
+    verify_tls: bool,
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, Optional[Dict[str, Any]]]:
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["token"] = token
+    try:
+        response = requests.request(
+            method,
+            url,
+            headers=headers,
+            json=payload,
+            timeout=30,
+            verify=verify_tls,
+        )
+    except requests.RequestException as exc:  # pragma: no cover - dependência externa
+        _err(f"Falha na requisição ao phpIPAM: {exc}")
+        return (1, None)
+
+    if response.status_code == 401:
+        _err("phpIPAM retornou 401 (token inválido ou expirado)")
+        return (1, None)
+
+    if response.status_code >= 500:
+        _err(f"phpIPAM retornou erro {response.status_code}: {response.text[:200]}")
+        return (1, None)
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        _err(f"Resposta inválida do phpIPAM (não é JSON): {exc}")
+        return (1, None)
+
+    if isinstance(data, dict) and not data.get("success", True):
+        message = data.get("message", "sem mensagem")
+        _err(f"phpIPAM retornou erro lógico: {message}")
+        return (1, data if isinstance(data, dict) else None)
+
+    return (0, data if isinstance(data, dict) else None)
+
+
+def ipam_login_for_token(base: str, username: str, password: str, verify_tls: bool) -> Optional[str]:
+    url = f"{base}/api/{env_first('PHPIPAM_APP_ID', 'IPAM_APP_ID', default='kea')}/user/" + username
+    payload = {"password": password}
+    rc, data = ipam_request("POST", url, token=None, verify_tls=verify_tls, payload=payload)
+    if rc != 0 or not data:
+        return None
+    token = data.get("data")
+    if isinstance(token, dict):
+        token = token.get("token")
+    if not token:
+        _err("phpIPAM não retornou token de autenticação")
+        return None
+    return str(token)
+
+
+def ipam_get_addresses(
+    base: str,
+    token: str,
+    subnet_id: str,
+    verify_tls: bool,
+) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
+    url = f"{base}/api/{env_first('PHPIPAM_APP_ID', 'IPAM_APP_ID', default='kea')}/subnets/{subnet_id}/addresses/"
+    rc, data = ipam_request("GET", url, token=token, verify_tls=verify_tls)
+    if rc != 0 or not data:
+        return (1, None)
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        _err(f"phpIPAM retornou dados inesperados para sub-rede {subnet_id}")
+        return (1, None)
+    return (0, rows)
+
+
+def ipam_get_subnet(
+    base: str,
+    token: str,
+    subnet_id: str,
+    verify_tls: bool,
+) -> Tuple[int, Optional[Dict[str, Any]]]:
+    url = f"{base}/api/{env_first('PHPIPAM_APP_ID', 'IPAM_APP_ID', default='kea')}/subnets/{subnet_id}/"
+    rc, data = ipam_request("GET", url, token=token, verify_tls=verify_tls)
+    if rc != 0 or not data:
+        return (1, None)
+    subnet = data.get("data")
+    if not isinstance(subnet, dict):
+        _err(f"phpIPAM retornou dados inesperados ao consultar a sub-rede {subnet_id}")
+        return (1, None)
+    return (0, subnet)
+
+
+def pick_first(row: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+    for key in keys:
+        if key in row:
+            value = row[key]
+            if value not in (None, ""):
+                return value
+    return default
+
+
+def build_items_from_ipam(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    truthy_values = get_custom_true_values()
+    flag_fields = get_custom_field_names()
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        ip_addr = row.get("ip")
+        try:
+            ip = ipaddress.ip_address(str(ip_addr))
+        except Exception:
+            _warn(f"Ignorado endereço IP inválido no phpIPAM: {ip_addr}")
+            continue
+        if ip.version != 4:
+            _debug(f"Ignorado {ip_addr}: apenas IPv4 é suportado")
+            continue
+        ip_s = str(ip)
+
+        flag_value = None
+        for field in flag_fields:
+            if field in row:
+                flag_value = row[field]
+                break
+        if flag_value is None:
+            _debug(f"Ignorado {ip_s}: campo custom não encontrado")
+            continue
+        if str(flag_value).strip().lower() not in truthy_values:
+            _debug(f"Ignorado {ip_s}: flag custom marcada como falsa")
+            continue
+
+        tipo_val = row.get("type")
+        if tipo_val is not None:
+            tipo_str = str(tipo_val).strip().lower()
+            if tipo_str in {"0", "dynamic", "dhcp"}:
+                _debug(f"Ignorado {ip_s}: tipo '{tipo_str}' não é estático")
+                continue
+
+        identifier_type = 0
+        identifier_hex: Optional[str] = None
+
+        client_id = pick_first(
+            row,
+            [
+                "client_id",
+                "custom_client_id",
+                "clientid",
+                "custom_clientid",
+            ],
+        )
+
+        if client_id not in (None, ""):
+            normalized_client_id = normalize_client_id(client_id)
+            if not normalized_client_id:
+                _warn(f"Pulado: {ip_s} com client-id inválido ({client_id})")
+                continue
+            identifier_type = 1
+            identifier_hex = normalized_client_id
+        else:
+            mac = pick_first(row, ["mac", "mac_address", "mac_addr", "hwaddr", "hw_address"])
+            normalized_mac = normalize_mac(mac)
+            if not normalized_mac:
+                _warn(f"Pulado: {ip_s} sem MAC válido")
+                continue
+            identifier_type = 0
+            identifier_hex = normalized_mac
+
+        hostname = pick_first(row, ["hostname", "hostname_fqdn", "dns_name", "name", "description"])
+
+        items.append(
+            {
+                "ip": ip_s,
+                "identifier_hex": identifier_hex,
+                "identifier_type": identifier_type,
+                "hostname": hostname,
+                "log_identifier": identifier_hex and _group_hex_pairs(identifier_hex) or "",
+            }
+        )
+    return items
+
+
+# ---------------------------
+# SSH helpers
+# ---------------------------
+def _split_extra_args(value: str) -> List[str]:
+    try:
+        return shlex.split(value)
+    except Exception:
+        return []
+
+
+def _build_ssh_base(settings: Dict[str, Any]) -> str:
+    user = settings.get("user")
+    host = settings.get("host")
+    if user:
+        return f"{user}@{host}"
+    return str(host)
+
+
+def _ssh_common_args(settings: Dict[str, Any], for_scp: bool) -> List[str]:
+    args: List[str] = []
+    if not settings.get("password"):
+        args.extend(["-o", "BatchMode=yes"])
+    identity = settings.get("identity")
+    if identity:
+        args.extend(["-i", identity])
+    port = settings.get("port")
+    if port:
+        args.extend(["-P" if for_scp else "-p", str(port)])
+    known_hosts = settings.get("known_hosts")
+    strict = settings.get("strict", True)
+    if known_hosts:
+        args.extend(["-o", f"UserKnownHostsFile={known_hosts}"])
+    elif not strict:
+        args.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+            ]
+        )
+    extra_args = settings.get("extra_args") or []
+    args.extend(extra_args)
+    return args
+
+
+def _load_ssh_settings() -> Optional[Dict[str, Any]]:
+    host = env_first("PF_SSH_HOST", "PFSENSE_HOST", "PFSENSE_SSH_HOST")
+    if not host:
+        return None
+    host = host.strip()
+    if not host:
+        return None
+    settings: Dict[str, Any] = {"host": host}
+    transport = "ssh"
+    user = env_first("PF_SSH_USER", "PFSENSE_USER", "PFSENSE_SSH_USER")
+    if user:
+        settings["user"] = user.strip()
+    port = env_first("PF_SSH_PORT", "PFSENSE_SSH_PORT")
+    if port:
+        try:
+            settings["port"] = int(port)
+        except (TypeError, ValueError):
+            _warn(f"PF_SSH_PORT inválida: {port}")
+    identity = env_first("PF_SSH_KEY", "PF_SSH_IDENTITY", "PFSENSE_SSH_KEY")
+    if identity:
+        settings["identity"] = identity.strip()
+    known_hosts = env_first("PF_SSH_KNOWN_HOSTS", "PFSENSE_KNOWN_HOSTS")
+    if known_hosts:
+        settings["known_hosts"] = known_hosts.strip()
+    strict = env_first("PF_SSH_STRICT_HOST_KEY_CHECKING", "PFSENSE_STRICT_HOST_KEY_CHECKING")
+    if strict is not None:
+        settings["strict"] = parse_bool(strict, default=True)
+    extra = env_first("PF_SSH_EXTRA_ARGS", "PFSENSE_SSH_EXTRA_ARGS")
+    if extra:
+        settings["extra_args"] = _split_extra_args(extra)
+    password = env_first(
+        "PF_SSH_PASSWORD",
+        "PFSENSE_SSH_PASSWORD",
+        "PF_SSH_PASS",
+        "PFSENSE_SSH_PASS",
+    )
+    if password:
+        settings["password"] = password
+        if shutil.which("sshpass"):
+            transport = "sshpass"
+        elif paramiko is not None:
+            transport = "paramiko"
+        else:
+            transport = "unsupported"
+    settings["_transport"] = transport
+    return settings
+
+
+def _wrap_ssh_with_password(
+    settings: Dict[str, Any], args: List[str]
+) -> Tuple[List[str], Optional[Dict[str, str]]]:
+    password = settings.get("password")
+    if not password or settings.get("_transport") != "sshpass":
+        return args, None
+    new_args = ["sshpass", "-e", *args]
+    env = os.environ.copy()
+    env["SSHPASS"] = password
+    return new_args, env
+
+
+def _paramiko_connect(settings: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
+    if paramiko is None:
+        return None, "biblioteca paramiko não instalada"
+    client = paramiko.SSHClient()
+    strict = settings.get("strict", True)
+    known_hosts = settings.get("known_hosts")
+    try:
+        client.load_system_host_keys()
+    except Exception:
+        pass
+    if known_hosts:
+        try:
+            client.load_host_keys(known_hosts)
+        except Exception:
+            return None, "falha ao carregar known_hosts"
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            settings["host"],
+            port=settings.get("port", 22),
+            username=settings.get("user"),
+            password=settings.get("password"),
+            key_filename=settings.get("identity"),
+            look_for_keys=strict,
+            allow_agent=strict,
+        )
+        return client, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _paramiko_run_command(settings: Dict[str, Any], command: str) -> Tuple[int, str, str]:
+    client, error = _paramiko_connect(settings)
+    if client is None:
+        return 127, "", error or "falha na conexão Paramiko"
+    try:
+        stdin, stdout, stderr = client.exec_command(command)
+        exit_status = stdout.channel.recv_exit_status()
+        stdout_data = stdout.read().decode(errors="ignore").strip()
+        stderr_data = stderr.read().decode(errors="ignore").strip()
+        return exit_status, stdout_data, stderr_data
+    except Exception as exc:
+        return 127, "", str(exc)
+    finally:
+        client.close()
+
+
+def _run_ssh_command(settings: Dict[str, Any], command: str) -> Tuple[int, str, str]:
+    transport = settings.get("_transport", "ssh")
+    if transport == "unsupported":
+        return 127, "", "Autenticação por senha requer 'sshpass' ou biblioteca 'paramiko'"
+    if transport == "paramiko":
+        return _paramiko_run_command(settings, command)
+    target = _build_ssh_base(settings)
+    args = ["ssh", *_ssh_common_args(settings, for_scp=False), target, command]
+    args, env = _wrap_ssh_with_password(settings, args)
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except FileNotFoundError:
+        missing = args[0]
+        if missing == "sshpass":
+            _err("Comando 'sshpass' não encontrado no PATH")
+            return (127, "", "sshpass não encontrado")
+        _err("Comando 'ssh' não encontrado no PATH")
+        return (127, "", "ssh não encontrado")
+
+
+def parse_mapping_env(*var_names: str) -> Dict[str, int]:
+    for var_name in var_names:
+        if not var_name:
+            continue
+        raw = os.getenv(var_name, "")
+        if not raw:
+            continue
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+            mapping = {str(k): int(v) for k, v in parsed.items()}
+            if mapping:
+                return mapping
+        except Exception:
+            pass
+        mapping: Dict[str, int] = {}
+        for part in raw.split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            k, v = part.split(":", 1)
+            try:
+                mapping[str(k.strip())] = int(v.strip())
+            except ValueError:
+                continue
+        if mapping:
+            return mapping
+    return {}
+
+
+# Expor helpers em um namespace compatível com o arquivo original
+jk._warn = _warn
+jk._err = _err
+jk._info = _info
+jk._debug = _debug
+jk._log = _log
+jk.setup_logging = setup_logging
+jk.load_env = load_env
+jk.env_first = env_first
+jk.parse_bool = parse_bool
+jk.parse_mapping_env = parse_mapping_env
+jk._load_ssh_settings = _load_ssh_settings
+jk._run_ssh_command = _run_ssh_command
+jk.is_debug_enabled = is_debug_enabled
+jk.is_debug_one_by_one_enabled = is_debug_one_by_one_enabled
+jk.build_ipam_base_url = build_ipam_base_url
+jk.ipam_get_addresses = ipam_get_addresses
+jk.ipam_get_subnet = ipam_get_subnet
+jk.ipam_login_for_token = ipam_login_for_token
+jk.build_items_from_ipam = build_items_from_ipam
+jk._group_hex_pairs = _group_hex_pairs
+jk.logging = logging
 
 
 def _encode_b64_json(data: Any) -> str:
