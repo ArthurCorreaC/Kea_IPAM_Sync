@@ -332,38 +332,75 @@ def push_staticmaps_to_pfsense(
 ) -> Tuple[bool, bool, List[str]]:
     if not staticmaps_by_iface:
         return True, False, []
-    payload = {"ifaces": staticmaps_by_iface}
-    payload_b64 = _encode_b64_json(payload)
-    note_b64 = _encode_b64_text(note)
-    code = _php_apply_staticmaps_code(payload_b64, note_b64)
-    if jk.is_debug_enabled():
-        jk._debug(
-            f"Enviando {sum(len(v.get('reservations', [])) for v in staticmaps_by_iface.values())} reservas em {len(staticmaps_by_iface)} interfaces para o pfSense"
-        )
-    rc, stdout, stderr = _run_php(code, ssh_settings)
-    if jk.is_debug_enabled():
-        jk._debug(
-            f"PHP retornou rc={rc}, stdout='{stdout[:200]}', stderr='{stderr[:200]}'"
-        )
-    if rc != 0:
-        message = stderr or stdout or f"php retornou código {rc}"
-        jk._err(f"Falha ao atualizar o pfSense: {message}")
-        return False, False, []
-    response = _decode_base64_json(stdout)
-    if not response:
-        return True, True, list(staticmaps_by_iface.keys())
-    if not response.get("ok", True):
-        error_msg = response.get("error") or "erro desconhecido"
-        jk._err(f"pfSense rejeitou atualização: {error_msg}")
-        return False, False, []
-    changed_ifaces = []
-    if response.get("changed"):
-        payload_ifaces = response.get("ifaces")
-        if isinstance(payload_ifaces, list):
-            changed_ifaces = [str(iface) for iface in payload_ifaces]
-        else:
-            changed_ifaces = list(staticmaps_by_iface.keys())
-    return True, bool(response.get("changed", False)), changed_ifaces
+    total_reservations = sum(len(v.get("reservations", [])) for v in staticmaps_by_iface.values())
+
+    def _send_payload(payload_ifaces: Dict[str, Dict[str, Any]]) -> Tuple[bool, bool, List[str]]:
+        payload = {"ifaces": payload_ifaces}
+        payload_b64 = _encode_b64_json(payload)
+        note_b64 = _encode_b64_text(note)
+        code = _php_apply_staticmaps_code(payload_b64, note_b64)
+        if jk.is_debug_enabled():
+            jk._debug(
+                f"Enviando {sum(len(v.get('reservations', [])) for v in payload_ifaces.values())} reservas em {len(payload_ifaces)} interfaces para o pfSense"
+            )
+        rc, stdout, stderr = _run_php(code, ssh_settings)
+        if jk.is_debug_enabled():
+            jk._debug(
+                f"PHP retornou rc={rc}, stdout='{stdout[:200]}', stderr='{stderr[:200]}'"
+            )
+        if rc != 0:
+            message = stderr or stdout or f"php retornou código {rc}"
+            jk._err(f"Falha ao atualizar o pfSense: {message}")
+            return False, False, []
+        response = _decode_base64_json(stdout)
+        if not response:
+            return True, True, list(payload_ifaces.keys())
+        if not response.get("ok", True):
+            error_msg = response.get("error") or "erro desconhecido"
+            jk._err(f"pfSense rejeitou atualização: {error_msg}")
+            return False, False, []
+        changed_ifaces_inner: List[str] = []
+        if response.get("changed"):
+            payload_ifaces_resp = response.get("ifaces")
+            if isinstance(payload_ifaces_resp, list):
+                changed_ifaces_inner = [str(iface) for iface in payload_ifaces_resp]
+            else:
+                changed_ifaces_inner = list(payload_ifaces.keys())
+        return True, bool(response.get("changed", False)), changed_ifaces_inner
+
+    if jk.is_debug_one_by_one_enabled():
+        if jk.is_debug_enabled():
+            jk._debug(
+                f"Modo debug_one_a_one ativo: enviando {total_reservations} reservas em lotes unitários por interface"
+            )
+        overall_changed = False
+        changed_ifaces: Set[str] = set()
+        for iface, data in staticmaps_by_iface.items():
+            reservations = list(data.get("reservations", []))
+            delete_flag = bool(data.get("delete"))
+            if delete_flag:
+                ok, changed, updated_ifaces = _send_payload({iface: data})
+                if not ok:
+                    return False, False, []
+                overall_changed = overall_changed or changed
+                changed_ifaces.update(updated_ifaces)
+                continue
+            cumulative: List[Dict[str, Any]] = []
+            for idx, entry in enumerate(reservations, 1):
+                cumulative.append(entry)
+                chunk_payload = {iface: {"reservations": list(cumulative)}}
+                ok, changed, updated_ifaces = _send_payload(chunk_payload)
+                if not ok:
+                    return False, False, []
+                overall_changed = overall_changed or changed
+                changed_ifaces.update(updated_ifaces)
+                if jk.is_debug_enabled():
+                    jk._debug(
+                        f"Reserva {idx}/{len(reservations)} aplicada na interface {iface} no modo 1-a-1"
+                    )
+        return True, overall_changed, sorted(changed_ifaces)
+
+    return _send_payload(staticmaps_by_iface)
 
 
 def get_config_path_segments() -> List[str]:

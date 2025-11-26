@@ -47,6 +47,13 @@ _DEBUG_ENV_NAMES = (
     "KEA_IPAM_SYNC_DEBUG",
     "PFSENSE_IPAM_SYNC_DEBUG",
 )
+_DEBUG_ONE_BY_ONE_ENV_NAMES = (
+    "DEBUG_ONE_A_ONE",
+    "DEBUG_ONE_BY_ONE",
+    "PFSENSE_DEBUG_ONE_A_ONE",
+    "PFSENSE_DEBUG_ONE_BY_ONE",
+    "KEA_IPAM_SYNC_DEBUG_ONE_A_ONE",
+)
 _DEBUG_TRUE_VALUES = {"1", "true", "yes", "y", "sim", "on"}
 _DEBUG_FALSE_VALUES = {"0", "false", "no", "n", "nao", "off"}
 
@@ -176,6 +183,19 @@ def _debug(msg: str) -> None:
 
 def is_debug_enabled() -> bool:
     return _is_debug_enabled()
+
+
+def is_debug_one_by_one_enabled() -> bool:
+    for name in _DEBUG_ONE_BY_ONE_ENV_NAMES:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        s = str(value).strip().lower()
+        if s in _DEBUG_TRUE_VALUES:
+            return True
+        if s in _DEBUG_FALSE_VALUES:
+            return False
+    return False
 
 
 def _info(msg: str) -> None:
