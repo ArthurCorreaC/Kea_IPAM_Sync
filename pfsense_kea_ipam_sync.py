@@ -87,6 +87,12 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
             exit(1);
         }}
 
+        function ensure_array_ref(&$value) {{
+            if (is_array($value) == false) {{
+                $value = array();
+            }}
+        }}
+
         function normalize_staticmap_entry($entry) {{
             if (is_array($entry) == false) {{
                 return null;
@@ -149,9 +155,8 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
             echo base64_encode(json_encode(['ok'=>false,'error'=>'payload inválido']));
             exit(1);
         }}
-        if (isset($config['dhcpd']) == false || is_array($config['dhcpd']) == false) {{
-            $config['dhcpd'] = array();
-        }}
+        ensure_array_ref($config);
+        ensure_array_ref($config['dhcpd']);
         $changed_ifaces = array();
         foreach ($payload['ifaces'] as $iface => $data) {{
             $iface = (string)$iface;
@@ -197,19 +202,15 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         if ($note === false) {{
             $note = 'Atualizado via pfsense_kea_ipam_sync.py';
         }}
-        if (
-            isset($config['notifications']) == false ||
-            is_array($config['notifications']) == false
-        ) {{
-            $config['notifications'] = array();
+        ensure_array_ref($config['notifications']);
+        ensure_array_ref($config['notifications']['smtp']);
+
+        try {{
+            write_config($note);
+        }} catch (Throwable $e) {{
+            echo base64_encode(json_encode(['ok'=>false,'error'=>'erro ao salvar config: '.$e->getMessage()]));
+            exit(1);
         }}
-        if (
-            isset($config['notifications']['smtp']) == false ||
-            is_array($config['notifications']['smtp']) == false
-        ) {{
-            $config['notifications']['smtp'] = array();
-        }}
-        write_config($note);
         if (function_exists('services_dhcpd_configure')) {{
             services_dhcpd_configure();
         }} elseif (function_exists('dhcpd_configure')) {{
