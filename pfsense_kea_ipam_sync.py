@@ -82,6 +82,11 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         @require_once('/etc/inc/functions.inc');
         @require_once('/etc/inc/services.inc');
 
+        if (isset($config) == false || is_array($config) == false) {
+            echo base64_encode(json_encode(['ok'=>false,'error'=>'config.xml inválido ou não carregado']));
+            exit(1);
+        }
+
         function normalize_staticmap_entry($entry) {{
             if (is_array($entry) == false) {{
                 return null;
@@ -708,9 +713,13 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             str(ipam_subnet), items, iface_networks, base, token, verify_tls, subnet_network_cache
         )
         if not iface:
-            jk._err(
+            base_msg = (
                 f"Não foi possível associar a sub-rede {ipam_subnet} a nenhuma interface do pfSense; confira o config.xml e as VLANs."
             )
+            if not items:
+                jk._warn(base_msg + " — sub-rede sem IPs foi ignorada")
+                continue
+            jk._err(base_msg)
             errors += 1
             continue
 
