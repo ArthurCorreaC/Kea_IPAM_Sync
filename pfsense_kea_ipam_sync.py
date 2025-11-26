@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import time
+import unicodedata
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import json_kea_ipam_sync as jk
@@ -32,7 +33,9 @@ def _compact_php(code: str) -> str:
 
 
 def _sanitize_hostname(hostname: str, max_length: int = 63) -> str:
-    cleaned = "".join(ch for ch in hostname if ch.isalnum() or ch in "-._")
+    normalized = unicodedata.normalize("NFKD", hostname)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    cleaned = "".join(ch for ch in normalized if ch.isalnum() or ch in "-._")
     cleaned = cleaned.strip("-._")
     if len(cleaned) > max_length:
         cleaned = cleaned[:max_length]
