@@ -31,6 +31,14 @@ def _compact_php(code: str) -> str:
     return " ".join(lines)
 
 
+def _sanitize_hostname(hostname: str, max_length: int = 63) -> str:
+    cleaned = "".join(ch for ch in hostname if ch.isalnum() or ch in "-._")
+    cleaned = cleaned.strip("-._")
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length]
+    return cleaned
+
+
 def _php_reader_code(path_b64: str) -> str:
     return _compact_php(
         f"""
@@ -91,6 +99,21 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
             if (is_array($value) == false) {{
                 $value = array();
             }}
+        }}
+
+        function ensure_array_path(&$root, $path) {{
+            if (is_array($root) == false) {{
+                $root = array();
+            }}
+            $segments = explode('/', $path);
+            $ref =& $root;
+            foreach ($segments as $segment) {{
+                if (isset($ref[$segment]) == false || is_array($ref[$segment]) == false) {{
+                    $ref[$segment] = array();
+                }}
+                $ref =& $ref[$segment];
+            }}
+            return $ref;
         }}
 
         function normalize_staticmap_entry($entry) {{
@@ -156,7 +179,7 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
             exit(1);
         }}
         ensure_array_ref($config);
-        ensure_array_ref($config['dhcpd']);
+        ensure_array_path($config, 'dhcpd');
         $changed_ifaces = array();
         foreach ($payload['ifaces'] as $iface => $data) {{
             $iface = (string)$iface;
@@ -202,8 +225,7 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         if ($note === false) {{
             $note = 'Atualizado via pfsense_kea_ipam_sync.py';
         }}
-        ensure_array_ref($config['notifications']);
-        ensure_array_ref($config['notifications']['smtp']);
+        ensure_array_path($config, 'notifications/smtp');
 
         try {{
             write_config($note);
@@ -489,8 +511,10 @@ def _build_staticmap_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         entry["cid"] = jk._group_hex_pairs(identifier_hex)
     hostname = item.get("hostname")
     if hostname:
-        entry["hostname"] = hostname
-        entry["descr"] = hostname
+        sanitized = _sanitize_hostname(str(hostname))
+        if sanitized:
+            entry["hostname"] = sanitized
+            entry["descr"] = sanitized
     return entry
 
 
