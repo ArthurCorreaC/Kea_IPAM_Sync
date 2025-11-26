@@ -42,6 +42,13 @@ _LOGGER.propagate = False
 _LOGGER_INITIALIZED = False
 _CURRENT_LOG_DIR: Optional[str] = None
 _CURRENT_RETENTION_DAYS = DEFAULT_LOG_RETENTION_DAYS
+_DEBUG_ENV_NAMES = (
+    "DEBUG",
+    "KEA_IPAM_SYNC_DEBUG",
+    "PFSENSE_IPAM_SYNC_DEBUG",
+)
+_DEBUG_TRUE_VALUES = {"1", "true", "yes", "y", "sim", "on"}
+_DEBUG_FALSE_VALUES = {"0", "false", "no", "n", "nao", "off"}
 
 
 def _cleanup_old_logs(log_dir: str, keep_days: int) -> None:
@@ -144,14 +151,31 @@ def _ensure_logger() -> logging.Logger:
     return _LOGGER
 
 
+def _is_debug_enabled() -> bool:
+    for name in _DEBUG_ENV_NAMES:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        s = str(value).strip().lower()
+        if s in _DEBUG_TRUE_VALUES:
+            return True
+        if s in _DEBUG_FALSE_VALUES:
+            return False
+    return False
+
+
 def _log(level: int, message: str) -> None:
     logger = _ensure_logger()
     logger.log(level, message)
 
 
 def _debug(msg: str) -> None:
-    if os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "on"):
+    if _is_debug_enabled():
         _log(logging.DEBUG, f"[DEBUG] {msg}")
+
+
+def is_debug_enabled() -> bool:
+    return _is_debug_enabled()
 
 
 def _info(msg: str) -> None:

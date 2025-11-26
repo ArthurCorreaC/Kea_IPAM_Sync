@@ -319,7 +319,15 @@ def push_staticmaps_to_pfsense(
     payload_b64 = _encode_b64_json(payload)
     note_b64 = _encode_b64_text(note)
     code = _php_apply_staticmaps_code(payload_b64, note_b64)
+    if jk.is_debug_enabled():
+        jk._debug(
+            f"Enviando {sum(len(v.get('reservations', [])) for v in staticmaps_by_iface.values())} reservas em {len(staticmaps_by_iface)} interfaces para o pfSense"
+        )
     rc, stdout, stderr = _run_php(code, ssh_settings)
+    if jk.is_debug_enabled():
+        jk._debug(
+            f"PHP retornou rc={rc}, stdout='{stdout[:200]}', stderr='{stderr[:200]}'"
+        )
     if rc != 0:
         message = stderr or stdout or f"php retornou código {rc}"
         jk._err(f"Falha ao atualizar o pfSense: {message}")
@@ -409,6 +417,10 @@ def _build_iface_network_index(
         if network is None:
             continue
         index[str(iface)] = network
+        if jk.is_debug_enabled():
+            jk._debug(
+                f"Interface {iface}: rede detectada {network} (ipaddr={ipaddr}, mask={mask})"
+            )
     return index
 
 
@@ -443,6 +455,8 @@ def _fetch_ipam_subnet_network(
     cache: Dict[str, Optional[ipaddress.IPv4Network]],
 ) -> Optional[ipaddress.IPv4Network]:
     if subnet_id in cache:
+        if jk.is_debug_enabled():
+            jk._debug(f"Sub-rede {subnet_id}: reutilizando rede em cache {cache[subnet_id]}")
         return cache[subnet_id]
     rc, data = jk.ipam_get_subnet(base, token, subnet_id, verify_tls)
     network: Optional[ipaddress.IPv4Network] = None
@@ -458,6 +472,8 @@ def _fetch_ipam_subnet_network(
             )
     else:
         jk._warn(f"phpIPAM não retornou detalhes para a sub-rede {subnet_id}")
+    if jk.is_debug_enabled():
+        jk._debug(f"Sub-rede {subnet_id}: rede descoberta {network}")
     cache[subnet_id] = network
     return network
 
@@ -485,11 +501,19 @@ def _determine_interface_for_subnet(
             jk._warn(
                 f"Sub-rede {subnet_id} tem IPs espalhados em múltiplas interfaces {list(matches.keys())}; usando {iface}"
             )
+        elif jk.is_debug_enabled():
+            jk._debug(
+                f"Sub-rede {subnet_id}: interface escolhida {iface} com base em IPs {matches}"
+            )
         return iface
     network = _fetch_ipam_subnet_network(base, token, subnet_id, verify_tls, network_cache)
     if network:
         iface = _match_network_to_iface(network, iface_networks)
         if iface:
+            if jk.is_debug_enabled():
+                jk._debug(
+                    f"Sub-rede {subnet_id}: interface {iface} combinada pela rede {network}"
+                )
             return iface
         jk._warn(
             f"Rede {network} da sub-rede {subnet_id} não corresponde a nenhum DHCP ativo no pfSense"
@@ -515,6 +539,10 @@ def _build_staticmap_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         if sanitized:
             entry["hostname"] = sanitized
             entry["descr"] = sanitized
+            if jk.is_debug_enabled() and sanitized != str(hostname):
+                jk._debug(
+                    f"Hostname sanitizado '{hostname}' -> '{sanitized}' para IP {item['ip']}"
+                )
     return entry
 
 
@@ -648,12 +676,17 @@ def _extract_current_staticmaps(
 
 
 def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, int]:
+    debug_enabled = jk.is_debug_enabled()
     base = jk.build_ipam_base_url()
     if not base:
         jk._err("Configure PHPIPAM_BASE_URL (e PHPIPAM_APP_ID) no .env — veja o .env.example.")
         return (0, 0, 1)
 
     verify_tls = jk.parse_bool(jk.env_first("PHPIPAM_VERIFY_TLS", "IPAM_VERIFY_TLS"), default=False)
+    if debug_enabled:
+        jk._debug(
+            f"Iniciando sync (dry_run={dry_run}, delete_missing={delete_missing}, verify_tls={verify_tls})"
+        )
     if not verify_tls:
         try:  # pragma: no cover - dependência opcional
             import urllib3  # type: ignore
@@ -681,8 +714,12 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             "Configure SUBNET_ID_MAP_JSON (ou SUBNET_ID_MAP/IPAM_SUBNETID_TO_ID) no .env para listar as sub-redes do phpIPAM a sincronizar."
         )
         return (0, 0, 1)
+    if debug_enabled:
+        jk._debug(f"Sub-redes configuradas para sincronizar: {ipam_subnet_ids}")
 
     ssh_settings = jk._load_ssh_settings()
+    if debug_enabled:
+        jk._debug(f"Configuração SSH carregada: {ssh_settings}")
     # Ainda validamos PF_CONFIG_PATH para alertar sobre caminhos inválidos
     get_config_path_segments()
     errors = 0
@@ -697,6 +734,10 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             "Não foi possível ler $config['dhcpd'] no pfSense; assumindo que não há reservas atuais para comparação"
         )
     current_staticmaps = _extract_current_staticmaps(dhcpd_config)
+    if debug_enabled:
+        jk._debug(
+            f"pfSense retornou {len(current_staticmaps)} interfaces com static-maps atuais"
+        )
 
     iface_networks = _build_iface_network_index(interfaces_config)
     if not iface_networks:
@@ -713,6 +754,11 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             errors += 1
             continue
         items = jk.build_items_from_ipam(data)
+
+        if debug_enabled:
+            jk._debug(
+                f"Sub-rede {ipam_subnet}: {len(items)} endereços retornados pelo phpIPAM"
+            )
 
         if not items:
             items = []
@@ -777,6 +823,11 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
                     jk._warn(f"Ignorado IP inválido {it.get('ip')} na sub-rede {ipam_subnet}")
                     continue
             filtered_items.append(it)
+
+        if debug_enabled:
+            jk._debug(
+                f"Sub-rede {ipam_subnet} vinculada à interface {iface}: {len(filtered_items)} IPs após filtro"
+            )
 
         if not filtered_items:
             msg = (
@@ -862,6 +913,11 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
         jk._info("Nenhuma alteração necessária — pfSense já estava sincronizado")
         return (total_reservations, 0, errors)
 
+    if debug_enabled:
+        jk._debug(
+            f"Interfaces a atualizar: {list(updates_payload.keys())}; reservas totais preparadas: {total_reservations}"
+        )
+
     if dry_run:
         for iface, data in updates_payload.items():
             count = len(data.get("reservations") or [])
@@ -923,6 +979,8 @@ def main() -> int:
 
     jk.load_env(args.env)
     jk.setup_logging(force=True)
+    if jk.is_debug_enabled():
+        jk._debug(f"Modo debug ativo; arquivo .env carregado de {args.env}")
 
     start = time.time()
     total_reservations, interfaces_modified, errors = sync(
