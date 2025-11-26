@@ -82,10 +82,10 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         @require_once('/etc/inc/functions.inc');
         @require_once('/etc/inc/services.inc');
 
-        if (isset($config) == false || is_array($config) == false) {
+        if (isset($config) == false || is_array($config) == false) {{
             echo base64_encode(json_encode(['ok'=>false,'error'=>'config.xml inválido ou não carregado']));
             exit(1);
-        }
+        }}
 
         function normalize_staticmap_entry($entry) {{
             if (is_array($entry) == false) {{
