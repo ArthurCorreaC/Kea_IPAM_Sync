@@ -1,7 +1,8 @@
 # 📘 Kea_IPAM_Sync
 
 Sincronização automática de reservas DHCP entre **phpIPAM** e **Kea DHCP**.
-Agora o projeto oferece três modos de sincronização:
+Agora o projeto oferece três modos de sincronização, cada um totalmente independente
+e executável de forma isolada (basta manter o script desejado na pasta):
 
 - `mysql_kea_ipam_sync.py`: grava diretamente na tabela `hosts` do banco MySQL usado pelo Kea.
 - `json_kea_ipam_sync.py`: gera/atualiza um arquivo `kea-dhcp4.conf`, ideal para ambientes como o **pfSense** que usam o Kea com backend em arquivo JSON.
@@ -39,7 +40,7 @@ kea_ipam_sync/
 ├── json_kea_ipam_sync.py   # Sincronização gerando arquivo kea-dhcp4.conf
 ├── pfsense_kea_ipam_sync.py # Sincronização atualizando o $config do pfSense
 ├── .env                  # Configurações de ambiente
-├── .env.example          # Exemplo de Configurações de ambiente
+├── .env.example          # Exemplo de Configurações de ambiente (pronto para copiar)
 ├── logs/                 # Pasta de logs de execução do projeto
 ├── README.md             # Documentação do projeto
 └── venv/                 # Arquivos de execução Python
@@ -76,6 +77,12 @@ pip install PyMySQL
 ```
 
 ### Exemplo de `.env`:
+Um arquivo `.env.example` já está disponível e cobre as variáveis usadas pelos três
+modos; basta copiá-lo e ajustar os valores:
+
+```bash
+cp .env.example .env
+```
 
 ```ini
 # --- phpIPAM (obrigatório) ---
