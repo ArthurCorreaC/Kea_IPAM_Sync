@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import time
+import unicodedata
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import json_kea_ipam_sync as jk
@@ -29,6 +30,16 @@ def _encode_b64_text(value: str) -> str:
 def _compact_php(code: str) -> str:
     lines = [line.strip() for line in code.strip().splitlines() if line.strip()]
     return " ".join(lines)
+
+
+def _sanitize_hostname(hostname: str, max_length: int = 63) -> str:
+    normalized = unicodedata.normalize("NFKD", hostname)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    cleaned = "".join(ch for ch in normalized if ch.isalnum() or ch in "-._")
+    cleaned = cleaned.strip("-._")
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length]
+    return cleaned
 
 
 def _php_reader_code(path_b64: str) -> str:
@@ -81,6 +92,37 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         @require_once('/etc/inc/util.inc');
         @require_once('/etc/inc/functions.inc');
         @require_once('/etc/inc/services.inc');
+
+        $debug_mode = filter_var(
+            getenv('PFSENSE_IPAM_SYNC_DEBUG') ?: getenv('KEA_IPAM_SYNC_DEBUG') ?: getenv('DEBUG'),
+            FILTER_VALIDATE_BOOLEAN
+        );
+
+        if (isset($config) == false || is_array($config) == false) {{
+            echo base64_encode(json_encode(['ok'=>false,'error'=>'config.xml inválido ou não carregado']));
+            exit(1);
+        }}
+
+        function ensure_array_ref(&$value) {{
+            if (is_array($value) == false) {{
+                $value = array();
+            }}
+        }}
+
+        function ensure_array_path(&$root, $path) {{
+            if (is_array($root) == false) {{
+                $root = array();
+            }}
+            $segments = explode('/', $path);
+            $ref =& $root;
+            foreach ($segments as $segment) {{
+                if (isset($ref[$segment]) == false || is_array($ref[$segment]) == false) {{
+                    $ref[$segment] = array();
+                }}
+                $ref =& $ref[$segment];
+            }}
+            return $ref;
+        }}
 
         function normalize_staticmap_entry($entry) {{
             if (is_array($entry) == false) {{
@@ -144,9 +186,8 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
             echo base64_encode(json_encode(['ok'=>false,'error'=>'payload inválido']));
             exit(1);
         }}
-        if (isset($config['dhcpd']) == false || is_array($config['dhcpd']) == false) {{
-            $config['dhcpd'] = array();
-        }}
+        ensure_array_ref($config);
+        ensure_array_path($config, 'dhcpd');
         $changed_ifaces = array();
         foreach ($payload['ifaces'] as $iface => $data) {{
             $iface = (string)$iface;
@@ -192,19 +233,26 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         if ($note === false) {{
             $note = 'Atualizado via pfsense_kea_ipam_sync.py';
         }}
-        if (
-            isset($config['notifications']) == false ||
-            is_array($config['notifications']) == false
-        ) {{
-            $config['notifications'] = array();
+        ensure_array_ref($config);
+        ensure_array_path($config, 'notifications');
+        ensure_array_path($config, 'notifications/smtp');
+
+        try {{
+            write_config($note);
+        }} catch (Throwable $e) {{
+            $error = 'erro ao salvar config: '.$e->getMessage();
+            if ($debug_mode) {{
+                $context = array(
+                    'config_type' => gettype($config),
+                    'notifications_type' => isset($config['notifications']) ? gettype($config['notifications']) : 'unset',
+                    'smtp_type' => isset($config['notifications']['smtp']) ? gettype($config['notifications']['smtp']) : 'unset',
+                    'smtp_dump' => isset($config['notifications']['smtp']) ? json_encode($config['notifications']['smtp']) : null,
+                );
+                $error .= ' | contexto: '.json_encode($context);
+            }}
+            echo base64_encode(json_encode(['ok'=>false,'error'=>$error]));
+            exit(1);
         }}
-        if (
-            isset($config['notifications']['smtp']) == false ||
-            is_array($config['notifications']['smtp']) == false
-        ) {{
-            $config['notifications']['smtp'] = array();
-        }}
-        write_config($note);
         if (function_exists('services_dhcpd_configure')) {{
             services_dhcpd_configure();
         }} elseif (function_exists('dhcpd_configure')) {{
@@ -287,30 +335,75 @@ def push_staticmaps_to_pfsense(
 ) -> Tuple[bool, bool, List[str]]:
     if not staticmaps_by_iface:
         return True, False, []
-    payload = {"ifaces": staticmaps_by_iface}
-    payload_b64 = _encode_b64_json(payload)
-    note_b64 = _encode_b64_text(note)
-    code = _php_apply_staticmaps_code(payload_b64, note_b64)
-    rc, stdout, stderr = _run_php(code, ssh_settings)
-    if rc != 0:
-        message = stderr or stdout or f"php retornou código {rc}"
-        jk._err(f"Falha ao atualizar o pfSense: {message}")
-        return False, False, []
-    response = _decode_base64_json(stdout)
-    if not response:
-        return True, True, list(staticmaps_by_iface.keys())
-    if not response.get("ok", True):
-        error_msg = response.get("error") or "erro desconhecido"
-        jk._err(f"pfSense rejeitou atualização: {error_msg}")
-        return False, False, []
-    changed_ifaces = []
-    if response.get("changed"):
-        payload_ifaces = response.get("ifaces")
-        if isinstance(payload_ifaces, list):
-            changed_ifaces = [str(iface) for iface in payload_ifaces]
-        else:
-            changed_ifaces = list(staticmaps_by_iface.keys())
-    return True, bool(response.get("changed", False)), changed_ifaces
+    total_reservations = sum(len(v.get("reservations", [])) for v in staticmaps_by_iface.values())
+
+    def _send_payload(payload_ifaces: Dict[str, Dict[str, Any]]) -> Tuple[bool, bool, List[str]]:
+        payload = {"ifaces": payload_ifaces}
+        payload_b64 = _encode_b64_json(payload)
+        note_b64 = _encode_b64_text(note)
+        code = _php_apply_staticmaps_code(payload_b64, note_b64)
+        if jk.is_debug_enabled():
+            jk._debug(
+                f"Enviando {sum(len(v.get('reservations', [])) for v in payload_ifaces.values())} reservas em {len(payload_ifaces)} interfaces para o pfSense"
+            )
+        rc, stdout, stderr = _run_php(code, ssh_settings)
+        if jk.is_debug_enabled():
+            jk._debug(
+                f"PHP retornou rc={rc}, stdout='{stdout[:200]}', stderr='{stderr[:200]}'"
+            )
+        if rc != 0:
+            message = stderr or stdout or f"php retornou código {rc}"
+            jk._err(f"Falha ao atualizar o pfSense: {message}")
+            return False, False, []
+        response = _decode_base64_json(stdout)
+        if not response:
+            return True, True, list(payload_ifaces.keys())
+        if not response.get("ok", True):
+            error_msg = response.get("error") or "erro desconhecido"
+            jk._err(f"pfSense rejeitou atualização: {error_msg}")
+            return False, False, []
+        changed_ifaces_inner: List[str] = []
+        if response.get("changed"):
+            payload_ifaces_resp = response.get("ifaces")
+            if isinstance(payload_ifaces_resp, list):
+                changed_ifaces_inner = [str(iface) for iface in payload_ifaces_resp]
+            else:
+                changed_ifaces_inner = list(payload_ifaces.keys())
+        return True, bool(response.get("changed", False)), changed_ifaces_inner
+
+    if jk.is_debug_one_by_one_enabled():
+        if jk.is_debug_enabled():
+            jk._debug(
+                f"Modo debug_one_a_one ativo: enviando {total_reservations} reservas em lotes unitários por interface"
+            )
+        overall_changed = False
+        changed_ifaces: Set[str] = set()
+        for iface, data in staticmaps_by_iface.items():
+            reservations = list(data.get("reservations", []))
+            delete_flag = bool(data.get("delete"))
+            if delete_flag:
+                ok, changed, updated_ifaces = _send_payload({iface: data})
+                if not ok:
+                    return False, False, []
+                overall_changed = overall_changed or changed
+                changed_ifaces.update(updated_ifaces)
+                continue
+            cumulative: List[Dict[str, Any]] = []
+            for idx, entry in enumerate(reservations, 1):
+                cumulative.append(entry)
+                chunk_payload = {iface: {"reservations": list(cumulative)}}
+                ok, changed, updated_ifaces = _send_payload(chunk_payload)
+                if not ok:
+                    return False, False, []
+                overall_changed = overall_changed or changed
+                changed_ifaces.update(updated_ifaces)
+                if jk.is_debug_enabled():
+                    jk._debug(
+                        f"Reserva {idx}/{len(reservations)} aplicada na interface {iface} no modo 1-a-1"
+                    )
+        return True, overall_changed, sorted(changed_ifaces)
+
+    return _send_payload(staticmaps_by_iface)
 
 
 def get_config_path_segments() -> List[str]:
@@ -381,6 +474,10 @@ def _build_iface_network_index(
         if network is None:
             continue
         index[str(iface)] = network
+        if jk.is_debug_enabled():
+            jk._debug(
+                f"Interface {iface}: rede detectada {network} (ipaddr={ipaddr}, mask={mask})"
+            )
     return index
 
 
@@ -415,6 +512,8 @@ def _fetch_ipam_subnet_network(
     cache: Dict[str, Optional[ipaddress.IPv4Network]],
 ) -> Optional[ipaddress.IPv4Network]:
     if subnet_id in cache:
+        if jk.is_debug_enabled():
+            jk._debug(f"Sub-rede {subnet_id}: reutilizando rede em cache {cache[subnet_id]}")
         return cache[subnet_id]
     rc, data = jk.ipam_get_subnet(base, token, subnet_id, verify_tls)
     network: Optional[ipaddress.IPv4Network] = None
@@ -430,6 +529,8 @@ def _fetch_ipam_subnet_network(
             )
     else:
         jk._warn(f"phpIPAM não retornou detalhes para a sub-rede {subnet_id}")
+    if jk.is_debug_enabled():
+        jk._debug(f"Sub-rede {subnet_id}: rede descoberta {network}")
     cache[subnet_id] = network
     return network
 
@@ -457,11 +558,19 @@ def _determine_interface_for_subnet(
             jk._warn(
                 f"Sub-rede {subnet_id} tem IPs espalhados em múltiplas interfaces {list(matches.keys())}; usando {iface}"
             )
+        elif jk.is_debug_enabled():
+            jk._debug(
+                f"Sub-rede {subnet_id}: interface escolhida {iface} com base em IPs {matches}"
+            )
         return iface
     network = _fetch_ipam_subnet_network(base, token, subnet_id, verify_tls, network_cache)
     if network:
         iface = _match_network_to_iface(network, iface_networks)
         if iface:
+            if jk.is_debug_enabled():
+                jk._debug(
+                    f"Sub-rede {subnet_id}: interface {iface} combinada pela rede {network}"
+                )
             return iface
         jk._warn(
             f"Rede {network} da sub-rede {subnet_id} não corresponde a nenhum DHCP ativo no pfSense"
@@ -483,8 +592,14 @@ def _build_staticmap_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         entry["cid"] = jk._group_hex_pairs(identifier_hex)
     hostname = item.get("hostname")
     if hostname:
-        entry["hostname"] = hostname
-        entry["descr"] = hostname
+        sanitized = _sanitize_hostname(str(hostname))
+        if sanitized:
+            entry["hostname"] = sanitized
+            entry["descr"] = sanitized
+            if jk.is_debug_enabled() and sanitized != str(hostname):
+                jk._debug(
+                    f"Hostname sanitizado '{hostname}' -> '{sanitized}' para IP {item['ip']}"
+                )
     return entry
 
 
@@ -618,12 +733,17 @@ def _extract_current_staticmaps(
 
 
 def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, int]:
+    debug_enabled = jk.is_debug_enabled()
     base = jk.build_ipam_base_url()
     if not base:
         jk._err("Configure PHPIPAM_BASE_URL (e PHPIPAM_APP_ID) no .env — veja o .env.example.")
         return (0, 0, 1)
 
     verify_tls = jk.parse_bool(jk.env_first("PHPIPAM_VERIFY_TLS", "IPAM_VERIFY_TLS"), default=False)
+    if debug_enabled:
+        jk._debug(
+            f"Iniciando sync (dry_run={dry_run}, delete_missing={delete_missing}, verify_tls={verify_tls})"
+        )
     if not verify_tls:
         try:  # pragma: no cover - dependência opcional
             import urllib3  # type: ignore
@@ -651,8 +771,12 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             "Configure SUBNET_ID_MAP_JSON (ou SUBNET_ID_MAP/IPAM_SUBNETID_TO_ID) no .env para listar as sub-redes do phpIPAM a sincronizar."
         )
         return (0, 0, 1)
+    if debug_enabled:
+        jk._debug(f"Sub-redes configuradas para sincronizar: {ipam_subnet_ids}")
 
     ssh_settings = jk._load_ssh_settings()
+    if debug_enabled:
+        jk._debug(f"Configuração SSH carregada: {ssh_settings}")
     # Ainda validamos PF_CONFIG_PATH para alertar sobre caminhos inválidos
     get_config_path_segments()
     errors = 0
@@ -667,6 +791,10 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             "Não foi possível ler $config['dhcpd'] no pfSense; assumindo que não há reservas atuais para comparação"
         )
     current_staticmaps = _extract_current_staticmaps(dhcpd_config)
+    if debug_enabled:
+        jk._debug(
+            f"pfSense retornou {len(current_staticmaps)} interfaces com static-maps atuais"
+        )
 
     iface_networks = _build_iface_network_index(interfaces_config)
     if not iface_networks:
@@ -683,6 +811,11 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             errors += 1
             continue
         items = jk.build_items_from_ipam(data)
+
+        if debug_enabled:
+            jk._debug(
+                f"Sub-rede {ipam_subnet}: {len(items)} endereços retornados pelo phpIPAM"
+            )
 
         if not items:
             items = []
@@ -708,9 +841,13 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
             str(ipam_subnet), items, iface_networks, base, token, verify_tls, subnet_network_cache
         )
         if not iface:
-            jk._err(
+            base_msg = (
                 f"Não foi possível associar a sub-rede {ipam_subnet} a nenhuma interface do pfSense; confira o config.xml e as VLANs."
             )
+            if not items:
+                jk._warn(base_msg + " — sub-rede sem IPs foi ignorada")
+                continue
+            jk._err(base_msg)
             errors += 1
             continue
 
@@ -743,6 +880,11 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
                     jk._warn(f"Ignorado IP inválido {it.get('ip')} na sub-rede {ipam_subnet}")
                     continue
             filtered_items.append(it)
+
+        if debug_enabled:
+            jk._debug(
+                f"Sub-rede {ipam_subnet} vinculada à interface {iface}: {len(filtered_items)} IPs após filtro"
+            )
 
         if not filtered_items:
             msg = (
@@ -828,6 +970,11 @@ def sync(dry_run: bool = False, delete_missing: bool = True) -> Tuple[int, int, 
         jk._info("Nenhuma alteração necessária — pfSense já estava sincronizado")
         return (total_reservations, 0, errors)
 
+    if debug_enabled:
+        jk._debug(
+            f"Interfaces a atualizar: {list(updates_payload.keys())}; reservas totais preparadas: {total_reservations}"
+        )
+
     if dry_run:
         for iface, data in updates_payload.items():
             count = len(data.get("reservations") or [])
@@ -889,6 +1036,8 @@ def main() -> int:
 
     jk.load_env(args.env)
     jk.setup_logging(force=True)
+    if jk.is_debug_enabled():
+        jk._debug(f"Modo debug ativo; arquivo .env carregado de {args.env}")
 
     start = time.time()
     total_reservations, interfaces_modified, errors = sync(
