@@ -5,14 +5,14 @@ Agora o projeto oferece três modos de sincronização, cada um totalmente indep
 e executável de forma isolada (basta manter o script desejado na pasta):
 
 - `mysql_kea_ipam_sync.py`: grava diretamente na tabela `hosts` do banco MySQL usado pelo Kea.
-- `json_kea_ipam_sync.py`: gera/atualiza um arquivo `kea-dhcp4.conf`, ideal para ambientes como o **pfSense** que usam o Kea com backend em arquivo JSON.
+- `json_kea_ipam_sync.py`: gera/atualiza um arquivo `kea-dhcp4.conf`, ideal para ambientes com **Kea DHCP Server** usando o Kea com backend em arquivo JSON.
 - `pfsense_kea_ipam_sync.py`: atualiza o `$config` do pfSense (config.xml) por meio de PHP, mantendo a interface web sincronizada.
 
 ## 🚀 Visão Geral
 - Consulta endereços no **phpIPAM** marcados com o campo custom `kea_reserve`.
 - Permite sincronizar de três formas:
   - **MySQL**: realiza operações `INSERT`, `UPDATE` e `DELETE` na tabela `hosts` do Kea (via `mysql_kea_ipam_sync.py`).
-  - **JSON**: escreve as reservas dentro de um `kea-dhcp4.conf` compatível com o Kea/pfSense (via `json_kea_ipam_sync.py`).
+  - **JSON**: escreve as reservas dentro de um `kea-dhcp4.conf` compatível com o Kea DHCP (via `json_kea_ipam_sync.py`).
   - **pfSense ($config)**: envia a configuração diretamente para o `config.xml` do pfSense usando `pfsense_kea_ipam_sync.py`.
 - Suporta execução periódica via **Cron**, garantindo sincronização contínua.
 - Mantém o Kea DHCP alinhado ao estado desejado do IPAM, seja via banco ou arquivo.
@@ -181,6 +181,7 @@ SUBNET_ID_MAP_JSON={"39":188}
 # --- Depuração ----------------------------------------------------------------
 # Defina como true para habilitar logs detalhados
 # DEBUG=false
+# DEBUG_ONE_A_ONE=false
 ```
 
 ---
