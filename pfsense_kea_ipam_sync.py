@@ -90,6 +90,11 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         @require_once('/etc/inc/functions.inc');
         @require_once('/etc/inc/services.inc');
 
+        $debug_mode = filter_var(
+            getenv('PFSENSE_IPAM_SYNC_DEBUG') ?: getenv('KEA_IPAM_SYNC_DEBUG') ?: getenv('DEBUG'),
+            FILTER_VALIDATE_BOOLEAN
+        );
+
         if (isset($config) == false || is_array($config) == false) {{
             echo base64_encode(json_encode(['ok'=>false,'error'=>'config.xml inválido ou não carregado']));
             exit(1);
@@ -225,12 +230,24 @@ def _php_apply_staticmaps_code(payload_b64: str, note_b64: str) -> str:
         if ($note === false) {{
             $note = 'Atualizado via pfsense_kea_ipam_sync.py';
         }}
+        ensure_array_ref($config);
+        ensure_array_path($config, 'notifications');
         ensure_array_path($config, 'notifications/smtp');
 
         try {{
             write_config($note);
         }} catch (Throwable $e) {{
-            echo base64_encode(json_encode(['ok'=>false,'error'=>'erro ao salvar config: '.$e->getMessage()]));
+            $error = 'erro ao salvar config: '.$e->getMessage();
+            if ($debug_mode) {{
+                $context = array(
+                    'config_type' => gettype($config),
+                    'notifications_type' => isset($config['notifications']) ? gettype($config['notifications']) : 'unset',
+                    'smtp_type' => isset($config['notifications']['smtp']) ? gettype($config['notifications']['smtp']) : 'unset',
+                    'smtp_dump' => isset($config['notifications']['smtp']) ? json_encode($config['notifications']['smtp']) : null,
+                );
+                $error .= ' | contexto: '.json_encode($context);
+            }}
+            echo base64_encode(json_encode(['ok'=>false,'error'=>$error]));
             exit(1);
         }}
         if (function_exists('services_dhcpd_configure')) {{
