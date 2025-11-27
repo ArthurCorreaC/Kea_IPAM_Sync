@@ -422,6 +422,11 @@ def ipam_get_addresses(
     if rc != 0 or not data:
         return (1, None)
     rows = data.get("data")
+    if rows is None:
+        _warn(
+            f"Sub-rede {subnet_id} não possui endereços cadastrados no phpIPAM; seguindo com lista vazia"
+        )
+        return (0, [])
     if not isinstance(rows, list):
         _err(f"phpIPAM retornou dados inesperados para sub-rede {subnet_id}")
         return (1, None)
